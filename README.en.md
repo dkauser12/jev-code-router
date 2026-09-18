@@ -1,0 +1,204 @@
+# jev
+
+[![CI](https://github.com/okooo5km/jev/actions/workflows/ci.yml/badge.svg)](https://github.com/okooo5km/jev/actions/workflows/ci.yml)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue)](jev/scripts/jev)
+
+**Typed decisions with calibrated probabilities, from the shell — `yes`/`pick`/`score` over TypeSafe Jev via OpenRouter. CLI + Agent Skill.**
+
+[中文](README.md) · English
+
+`jev` is an unofficial community wrapper and supports only the OpenRouter backend; it has no
+affiliation with TypeSafe or OpenRouter. Single file, standard library only, Python 3.9+. One call
+takes about 1 second and costs about $0.00002.
+
+By **okooo5km(十里)**. [More skills](https://sink.5km.tech/skills).
+
+```bash
+$ jev yes "Is the user asking for a refund?" -s "Zipic crashes on launch. Refund me!"
+yes	0.97
+
+$ jev pick "Who should handle this" code="write or change code" research="needs to search the web" --other -s "write me a Python script"
+code
+
+$ jev score "How many stars" --range 1-5 -s "Pretty good, minor issues though"
+3.73	4
+
+$ jev run mail -s "Subject: Your App Review Has Passed ..."
+category     app_review  p=1.00 conf=1.00
+urgency      today       score=1.41/3 conf=0.15
+needs_reply  no          p=0.05
+is_promo     no          p=0.09
+```
+
+## 1. Install the CLI (macOS / Linux)
+
+```sh
+curl --proto '=https' --tlsv1.2 -fLsS https://github.com/okooo5km/jev/releases/download/v0.1.0/install.sh -o /tmp/jev-install.sh
+sh /tmp/jev-install.sh
+export PATH="$HOME/.local/bin:$PATH"
+jev --version
+```
+
+Downloaded first so you can inspect it before running. Requirements: `python3` >= 3.9, `curl`,
+`tar`, `shasum` or `sha256sum`. It writes the skill folder (CLI + built-in specs + docs) to
+`${XDG_DATA_HOME:-~/.local/share}/jev/`, then symlinks `~/.local/bin/jev` to `scripts/jev` inside
+it. No shell profile edits, no sudo, safe to run again (idempotent).
+
+Env overrides: `JEV_VERSION` (default `v0.1.0`), `JEV_HOME` (skill folder location),
+`JEV_INSTALL_DIR` (symlink location, default `~/.local/bin`), `JEV_ARCHIVE_DIR` (offline install,
+a directory already holding the downloaded archive and checksum).
+
+Manual install: download `jev-vX.Y.Z.tar.gz`, its `.sha256` and `install.sh` from
+[Releases](https://github.com/okooo5km/jev/releases/latest) into one directory, verify, then install offline:
+
+```sh
+shasum -a 256 -c jev-v0.1.0.tar.gz.sha256
+JEV_ARCHIVE_DIR=. sh install.sh
+```
+
+Windows: untested, use WSL.
+
+Uninstall:
+
+```sh
+rm -f ~/.local/bin/jev
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/jev"
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/jev"   # optional: also removes the key and custom specs
+```
+
+## 2. Install the skill
+
+```sh
+npx skills add okooo5km/jev -g
+```
+
+Node.js is only needed for this installer, not for the CLI itself. Add `-a claude-code codex ...`
+to target specific agents. The skill bundles the CLI at `scripts/jev`; an agent links it onto PATH
+on first use. Update with `npx skills update jev -g`, remove with `npx skills remove jev -g`.
+
+```text
+Use jev to check whether this ticket is asking for a refund.
+Run jev run feedback over this batch of reviews and flag anything that needs a human.
+```
+
+## 3. Configure an OpenRouter key
+
+Create a key at [openrouter.ai/keys](https://openrouter.ai/keys). Either:
+
+```sh
+# A. Environment variable (shell profile, secret manager, or a CI secret)
+export OPENROUTER_API_KEY=sk-or-...
+
+# B. Config file
+mkdir -p ~/.config/jev && ${EDITOR:-vi} ~/.config/jev/.env
+# add one line: OPENROUTER_API_KEY=sk-or-...
+chmod 600 ~/.config/jev/.env
+```
+
+Lookup order: environment -> `$JEV_ENV_FILE` -> `~/.config/jev/.env` (`XDG_CONFIG_HOME` overrides
+the config dir). There is no `./.env` (current-directory) lookup -- a key belongs to the user, not
+a checkout. Never paste a key into chat, and never pass one as a command-line argument.
+
+## 4. Quickstart
+
+| Verb | Purpose | Output | Exit code |
+|---|---|---|---|
+| `yes` | yes/no | `yes\t0.97` | 0 yes · 1 no · 2 error |
+| `pick` | one of N | the chosen option | 0 done · 1 below `--min-confidence` · 2 error |
+| `score` | ordinal score | `VALUE\tLABEL` | 0 done · 2 error |
+| `filter` | semantic grep | matching input lines | 0 some matched · 1 none · 2 a line errored |
+| `run` | several questions at once | aligned table | 0 done · 2 error |
+| `raw` | the raw request body | response JSON | 0 done · 2 error |
+
+```bash
+# Line mode: one decision per line, 8-way concurrent, input order preserved
+printf '%s\n%s\n' '{"text":"please add dark mode"}' '{"text":"crashed three times, refund me"}' \
+  | jev run feedback -l --field text --json
+
+# --json: full probability distribution and usage, for scripts to consume
+jev run route -s "check whether I have any important email today" --json
+
+# Tail a live log, keep only what deserves attention
+tail -f app.log | jev filter "log line is a user-visible failure" --false "debug noise, normal requests"
+```
+
+## 5. Write questions Jev can answer
+
+Jev reads conditions literally; it does not infer intent.
+
+- State observable conditions, not goals; spell out both sides with `--true`/`--false` or
+  `criteria`.
+- Cover every case in an option set, or add `--other` when it might not.
+- Order score labels low to high, 2-10 of them.
+- Ask every question about one piece of state in a single spec (one call, near-zero extra cost).
+- Trim the state to what the question needs; don't paste in a whole document.
+
+Measured counter-example: `jev filter "contains specific, actionable information"` matched an ad
+("Add me on WeChat for a free AI course, three days only") at about 0.9 -- literally, an ad *is*
+actionable. Rewriting it to `jev filter "the message gives specific technical, product or industry
+information" --false "small talk, greetings, ads, lead generation, course sales"` excludes the
+same message (`exit 1`, no match).
+
+## 6. Templates
+
+`jev run` lists the available specs. Five ship built in, all JSON (readable on any 3.9+):
+
+| Name | Judges |
+|---|---|
+| `mail` | category, urgency, needs a reply, pure promo |
+| `feedback` | intent, sentiment, needs a human, churn risk |
+| `signal` | whether a chat message/tweet is worth reading, topic, novelty |
+| `commit` | Conventional Commit type, secret leaks, breaking changes, risk |
+| `route` | which handler a request needs, complexity, needs web/private data |
+
+Custom specs live in `~/.config/jev/specs/` (`XDG_CONFIG_HOME` overrides the config dir), as JSON
+or TOML -- JSON works on any 3.9+, TOML needs 3.11+ (`tomllib`) and fails with a clear message
+below that instead of crashing:
+
+```json
+{
+  "description": "One line shown by `jev run`",
+  "threshold": 0.5,
+  "questions": {
+    "urgent": { "type": "noul", "instructions": "Is this urgent",
+                "criteria": { "true": "Needs action now", "false": "Can be scheduled" } }
+  }
+}
+```
+
+```toml
+description = "One line shown by `jev run`"
+threshold = 0.5
+
+[questions.urgent]
+type = "noul"
+instructions = "Is this urgent"
+[questions.urgent.criteria]
+true = "Needs action now"
+false = "Can be scheduled"
+```
+
+## 7. Cost and limits
+
+$0.042/M input tokens, output free; about 1 second per call, about $0.00002 (roughly 2 cents per
+1,000 decisions). Keep state plus the longest question under ~32K tokens. `score` allows at most
+10 levels (an API limit). Rate limit is about 1,200 requests/minute; keep `-j`/line-mode
+concurrency at 16 or below. The endpoint is OpenRouter's alpha API; override with `JEV_BASE_URL`
+if it moves. Jev only decides -- it never generates text, so reading, writing or summarizing
+whatever survives the filter is still on you.
+
+## 8. Development and verification
+
+```sh
+python3 -m unittest discover -s tests -v      # offline, stdlib only, no real key needed
+shellcheck -s sh installers/install.sh .github/package.sh
+sh .github/package.sh v0.1.0                  # produces dist/jev-v0.1.0.tar.gz(.sha256)
+gh release create v0.1.0 dist/* installers/install.sh
+```
+
+## License
+
+Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Independent community project, not
+affiliated with TypeSafe or OpenRouter. See more of the author's skills at
+[sink.5km.tech/skills](https://sink.5km.tech/skills). Stars and PRs welcome.

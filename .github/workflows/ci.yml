@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: shellcheck installers/install.sh and .github/package.sh
+        run: shellcheck -s sh installers/install.sh .github/package.sh
+      - name: py_compile the CLI and the test suite
+        run: python -m py_compile jev/scripts/jev tests/*.py
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: '3.9'
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: ubuntu-latest
+            python-version: '3.13'
+          - os: macos-latest
+            python-version: '3.11'
+          - os: macos-latest
+            python-version: '3.13'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests -v
+  test-macos-system-python:
+    # macOS ships its own /usr/bin/python3 (via the Xcode Command Line
+    # Tools), independent of setup-python above and typically Python 3.9 --
+    # the realistic "nothing installed" case the README promises works.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: /usr/bin/python3 --version
+      - run: /usr/bin/python3 -m unittest discover -s tests -v
