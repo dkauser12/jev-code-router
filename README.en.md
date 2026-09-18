@@ -179,6 +179,9 @@ true = "Needs action now"
 false = "Can be scheduled"
 ```
 
+A question accepts only `type`, `instructions` and `criteria`; any other key fails loudly instead of
+being dropped. A yes/no question's descriptions go inside `criteria`, with both `true` and `false`.
+
 ## 7. Cost and limits
 
 $0.042/M input tokens, output free; about 1 second per call, about $0.00002 (roughly 2 cents per

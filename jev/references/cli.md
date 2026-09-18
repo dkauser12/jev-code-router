@@ -145,7 +145,7 @@ A spec mirrors the API request body plus a `description` and an optional `thresh
 }
 ```
 
-Field rules, enforced before any request is sent: every question needs `type` (`choice`/`score`/`noul`) and non-empty `instructions`. `choice.criteria` is an object with ≥2 entries. `score.criteria` is an array of 2–10 labels, low to high. `noul.criteria` is optional, but if present must have both `true` and `false` — the API rejects one-sided criteria.
+Field rules, enforced before any request is sent: every question needs `type` (`choice`/`score`/`noul`) and non-empty `instructions`. `choice.criteria` is an object with ≥2 entries. `score.criteria` is an array of 2–10 labels, low to high. `noul.criteria` is optional, but if present must have both `true` and `false` — the API rejects one-sided criteria. A question may hold only `type`, `instructions` and `criteria`; any other key (for example `true`/`false` placed beside `instructions` instead of inside `criteria`) is an error, never silently dropped.
 
 Lookup order for `jev run NAME` (first match wins): `<config dir>/specs/NAME.toml` or `.json` → the skill's own `specs/NAME.json`. `jev run /any/path.json` bypasses discovery. TOML needs Python ≥ 3.11 (`tomllib`); on older Python a same-named `.json` wins, and a TOML-only spec fails with a clear "needs 3.11+" error instead of a traceback. The five built-ins ship as JSON so they work on Python 3.9 out of the box: `mail`, `feedback`, `signal`, `commit`, `route` — see [SKILL.md](../SKILL.md) for what each judges.
 

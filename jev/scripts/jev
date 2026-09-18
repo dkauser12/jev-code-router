@@ -523,6 +523,17 @@ def validate_spec(data, path):
             raise JevError(f"jev: spec 格式错误 {path}: questions.{name}.type 必须是 choice/score/noul", 2)
         if not q.get("instructions"):
             raise JevError(f"jev: spec 格式错误 {path}: questions.{name} 缺少 instructions", 2)
+        # 只有 type / instructions / criteria 会发给 API；其余字段报错，不能静默丢弃
+        extra = sorted(set(q) - {"type", "instructions", "criteria"})
+        if extra:
+            hint = ""
+            if qtype == "noul" and {"true", "false"} & set(extra):
+                hint = f"；是非题两端的描述写在 criteria 里：[questions.{name}.criteria] true = \"…\" false = \"…\""
+            raise JevError(
+                f"jev: spec 格式错误 {path}: questions.{name} 含未知字段 {', '.join(extra)}"
+                f"（只支持 type / instructions / criteria）{hint}",
+                2,
+            )
         if qtype == "choice":
             crit = q.get("criteria")
             if not isinstance(crit, dict) or len(crit) < 2:

@@ -107,6 +107,31 @@ class RunCustomSpecTests(JevTestCase):
             self.assertIn("true 和 false", proc.stderr)
             self.assertEqual(mock.request_count, 0)
 
+    def test_unknown_question_keys_rejected_with_criteria_hint(self):
+        # Yes/no descriptions placed beside instructions instead of inside
+        # criteria used to be dropped silently; they must now fail loudly.
+        spec = {
+            "description": "misplaced noul descriptions",
+            "questions": {
+                "urgent": {
+                    "type": "noul",
+                    "instructions": "is this urgent",
+                    "true": {"value": "urgent"},
+                    "false": {"value": "not urgent"},
+                }
+            },
+        }
+        (self.user_specs_dir() / "misplaced.json").write_text(
+            json.dumps(spec), encoding="utf-8"
+        )
+        with MockDecisionsServer() as mock:
+            env = self.base_env(JEV_BASE_URL=mock.base_url)
+            proc = self.run_jev(["run", "misplaced", "-s", "YES case"], env=env)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("未知字段 false, true", proc.stderr)
+            self.assertIn("criteria", proc.stderr)
+            self.assertEqual(mock.request_count, 0)
+
 
 class RawTests(JevTestCase):
     def test_raw_echoes_api_response(self):

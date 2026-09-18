@@ -76,10 +76,16 @@ A spec mirrors the API body. Save new ones under `<config dir>/specs/` (`~/.conf
       "instructions": "How soon must someone act?",
       "criteria": ["can wait", "this week", "today", "now"]
     },
-    "needs_reply": { "type": "noul", "instructions": "The sender expects a personal reply" }
+    "needs_reply": {
+      "type": "noul",
+      "instructions": "The sender expects a personal reply",
+      "criteria": { "true": "Asks a question or waits for a decision", "false": "Notice or receipt only" }
+    }
   }
 }
 ```
+
+Only `type`, `instructions` and `criteria` are allowed in a question; anything else is rejected before a request is sent. A `noul` question's yes/no descriptions go inside `criteria` (both `true` and `false`).
 
 ## Limits
 
