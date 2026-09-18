@@ -1,9 +1,14 @@
-# Local mock of OpenRouter's POST /api/alpha/decisions, for offline jev tests.
+# Local mock of OpenRouter's POST /api/alpha/decisions and GET /api/v1/key,
+# for offline jev tests.
 #
 # Not a test module itself (no Test* classes) -- imported by tests/test_*.py.
 # Validates request shape the way the real API is documented to (model/state/
 # questions present and typed, per-type criteria rules), then returns a
 # deterministic canned answer so tests can assert exact output.
+#
+# GET /api/v1/key (used by `jev auth check`): `Bearer <expected_key>` -> 200
+# with a canned key-info body (including a fake `label` and `creator_user_id`
+# so tests can confirm the CLI never prints either); any other bearer -> 401.
 #
 # Canned-answer convention, read from the `state` when it is a plain string:
 #   noul question   -- "YES" in text -> 0.9, "NO" in text -> 0.1, else 0.5
@@ -28,10 +33,26 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+DEFAULT_KEY_INFO = {
+    # Deliberately includes label / creator_user_id: `jev auth check` must
+    # never print either, and tests assert that directly against this data.
+    "label": "sk-or-v1-abc...xyz",
+    "usage": 2.25,
+    "usage_daily": 0.1,
+    "limit": None,
+    "limit_remaining": None,
+    "is_free_tier": False,
+    "creator_user_id": "user_fake00000000000000000",
+}
+
+
 class MockDecisionsServer:
-    def __init__(self, expected_key="test", path="/api/alpha/decisions"):
+    def __init__(self, expected_key="test", path="/api/alpha/decisions",
+                 key_path="/api/v1/key", key_info=None):
         self.expected_key = expected_key
         self.path = path
+        self.key_path = key_path
+        self.key_info = dict(DEFAULT_KEY_INFO if key_info is None else key_info)
         self._lock = threading.Lock()
         self._requests = []
         self._retry_seen = set()
@@ -57,6 +78,10 @@ class MockDecisionsServer:
     @property
     def base_url(self):
         return f"http://127.0.0.1:{self.port}{self.path}"
+
+    @property
+    def key_url(self):
+        return f"http://127.0.0.1:{self.port}{self.key_path}"
 
     def log(self, entry):
         with self._lock:
@@ -182,6 +207,22 @@ def _make_handler(server):
             self.end_headers()
             self.wfile.write(payload)
 
+        def do_GET(self):  # noqa: N802 - stdlib method name
+            auth = self.headers.get("Authorization", "")
+            server.log({
+                "path": self.path,
+                "method": "GET",
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": None,
+            })
+            if self.path != server.key_path:
+                self._send_json(404, _plain_error_body("Not found"))
+                return
+            if auth != f"Bearer {server.expected_key}":
+                self._send_json(401, _plain_error_body("User not found."))
+                return
+            self._send_json(200, {"data": server.key_info})
+
         def do_POST(self):  # noqa: N802 - stdlib method name
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b""
@@ -194,6 +235,7 @@ def _make_handler(server):
 
             server.log({
                 "path": self.path,
+                "method": "POST",
                 # Lowercased: HTTP header names are case-insensitive, and
                 # urllib's own str.capitalize() re-casing of the request
                 # headers means the wire casing isn't reliably "X-Title" etc.

@@ -43,7 +43,8 @@ jev --version
 Downloaded first so you can inspect it before running. Requirements: `python3` >= 3.9, `curl`,
 `tar`, `shasum` or `sha256sum`. It writes the skill folder (CLI + built-in specs + docs) to
 `${XDG_DATA_HOME:-~/.local/share}/jev/`, then symlinks `~/.local/bin/jev` to `scripts/jev` inside
-it. No shell profile edits, no sudo, safe to run again (idempotent).
+it. No shell profile edits, no sudo, safe to run again (idempotent). Next step: run `jev auth set`
+to configure a key (section 3).
 
 Env overrides: `JEV_VERSION` (default `v0.1.1`), `JEV_HOME` (skill folder location),
 `JEV_INSTALL_DIR` (symlink location, default `~/.local/bin`), `JEV_ARCHIVE_DIR` (offline install,
@@ -84,13 +85,38 @@ Run jev run feedback over this batch of reviews and flag anything that needs a h
 
 ## 3. Configure an OpenRouter key
 
-Create a key at [openrouter.ai/keys](https://openrouter.ai/keys). Either:
+Recommended: run `jev auth set` in your own terminal. Input is hidden, and the key never goes
+through chat, a command-line argument, or shell history. No `sk-or-` key yet? Create one at
+[openrouter.ai/keys](https://openrouter.ai/keys) first.
+
+```bash
+$ jev auth set
+OpenRouter API key（输入不回显）:
+已保存到 ~/.config/jev/.env（权限 600）。运行 jev auth check 验证。
+
+$ jev auth status
+来源：配置文件 ~/.config/jev/.env
+文件：~/.config/jev/.env
+权限：600
+
+$ jev auth check
+密钥有效
+额度：无上限
+累计用量：0.12 USD
+```
+
+`auth status` only reports source, path and permissions (and suggests `chmod 600` when the mode is
+looser); `auth check` verifies online (read-only, no charge). Neither ever prints the key itself.
+
+CI and other non-interactive environments have no terminal; use the environment variable instead:
 
 ```sh
-# A. Environment variable (shell profile, secret manager, or a CI secret)
 export OPENROUTER_API_KEY=sk-or-...
+```
 
-# B. Config file
+You can also bypass `auth set` and edit the file yourself:
+
+```sh
 mkdir -p ~/.config/jev && ${EDITOR:-vi} ~/.config/jev/.env
 # add one line: OPENROUTER_API_KEY=sk-or-...
 chmod 600 ~/.config/jev/.env
@@ -98,7 +124,12 @@ chmod 600 ~/.config/jev/.env
 
 Lookup order: environment -> `$JEV_ENV_FILE` -> `~/.config/jev/.env` (`XDG_CONFIG_HOME` overrides
 the config dir). There is no `./.env` (current-directory) lookup -- a key belongs to the user, not
-a checkout. Never paste a key into chat, and never pass one as a command-line argument.
+a checkout.
+
+**Security note:** mode 600 keeps out other OS users; any program running as you -- agents
+included -- can still read any file you can read, and `chmod` does not change that. What `auth
+set` actually guarantees is narrower: the key never passes through chat, a command-line argument,
+or shell history.
 
 ## 4. Quickstart
 

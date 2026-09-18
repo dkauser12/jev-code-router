@@ -55,6 +55,20 @@ jev raw < body.json
 
 Reads a complete `{"model", "state", "questions"}` request body from stdin (`model` defaults to `-m`/`$JEV_MODEL`/`~typesafe/jev-latest` if omitted) and prints the API's response JSON unmodified. No client-side validation, no `criteria` normalization — use this to debug a spec or exercise a feature the typed verbs do not expose yet.
 
+### `auth` — manage `OPENROUTER_API_KEY`
+
+```text
+jev auth set
+jev auth status
+jev auth check
+```
+
+`auth set` is the recommended way to store the key: the user runs it in their own terminal, and the key never goes through chat, a command-line argument or shell history.
+
+- **`set`** refuses unless stdin is a real TTY (exit 2, nothing changed) — an agent has no terminal to type into, by design. Interactively prompts `OpenRouter API key（输入不回显）: ` via `getpass` (input never echoed), strips whitespace, and rejects an empty answer. A value not starting with `sk-or-` gets a stderr warning and a `继续保存吗？[y/N]` confirmation (default no). On accept, writes `OPENROUTER_API_KEY=<key>` to `<config dir>/.env`: any other lines in that file are preserved, an existing `OPENROUTER_API_KEY=`/`export OPENROUTER_API_KEY=` line is replaced, the config dir is created `0700` if missing, and the write is atomic (temp file in the same directory, `fsync`, `os.replace`, then `chmod 600`). If `.env` is itself a symlink, the target is written and the symlink is left pointing at it. Never prints the key.
+- **`status`** reports which source `auth`'s lookup would use — the environment variable, `$JEV_ENV_FILE`, or the config file — plus the file's path (and symlink target, if any) and permission bits, with a `chmod 600` warning when group/other can read it. Never prints the key. Exit 0 if a key is configured, 1 if not (with a hint to run `auth set`).
+- **`check`** makes one `GET $JEV_KEY_URL` (default `https://openrouter.ai/api/v1/key`) with the same `Authorization`/`X-Title`/`HTTP-Referer` headers as a decision call, and reports validity, spend limit (`无上限` if null) and remaining balance, and total usage — a free, read-only endpoint. Never prints the response's `label` (an unlabeled key's `label` is a masked fragment of the key itself) or `creator_user_id`. HTTP 401 → a message pointing at `auth set`, exit 2; a missing key or a network failure also exit 2 without guessing.
+
 ## Common options
 
 | Option | Applies to | Meaning |
@@ -83,10 +97,11 @@ State auto-detection (without `--text`): if the trimmed input starts with `{` or
 | `JEV_ENV_FILE` | An additional `.env`-style file to check for the key, before the config-dir default. |
 | `JEV_MODEL` | Default model ID, below an explicit `-m`. |
 | `JEV_BASE_URL` | Overrides the decisions endpoint (default `https://openrouter.ai/api/alpha/decisions`); used by this project's own tests, and useful if the alpha path moves. |
+| `JEV_KEY_URL` | Overrides the `auth check` endpoint (default `https://openrouter.ai/api/v1/key`). |
 | `XDG_CONFIG_HOME` | Overrides the config dir's parent (default `~/.config`); the config dir is `$XDG_CONFIG_HOME/jev` or `~/.config/jev`. |
 | `JEV_DEBUG=1` | Print each outgoing request body to stderr. Never prints the key. |
 
-Key lookup order: environment `OPENROUTER_API_KEY` → `$JEV_ENV_FILE` → `<config dir>/.env`. There is no repository-local `./.env` lookup — a key belongs to the user, not a checkout. `<config dir>/.env` is a plain `KEY=value` file, one line: `OPENROUTER_API_KEY=sk-or-...`. Set its permissions to `600`.
+Key lookup order: environment `OPENROUTER_API_KEY` → `$JEV_ENV_FILE` → `<config dir>/.env`. There is no repository-local `./.env` lookup — a key belongs to the user, not a checkout. `<config dir>/.env` is a plain `KEY=value` file, one line: `OPENROUTER_API_KEY=sk-or-...`, permissions `600`. `jev auth set` writes it for you (see below); `jev auth status` reports which of the three sources is active without printing the key.
 
 Every request also carries `X-Title: jev-cli` and `HTTP-Referer: https://github.com/okooo5km/jev` — OpenRouter's attribution headers, not authentication.
 
@@ -99,6 +114,9 @@ Every request also carries `X-Title: jev-cli` and `HTTP-Referer: https://github.
 | `score` | ran | — | error |
 | `filter` | ≥1 line matched | 0 lines matched | any line errored |
 | `run`, `raw` | ran | — | error |
+| `auth status` | key configured | not configured | — |
+| `auth set` | saved | — | no TTY, empty input, declined confirmation, or write failure |
+| `auth check` | valid | — | invalid (401), missing key, or network error |
 | line mode (`-l`) | all lines ok | — | ≥1 line failed (detail on stderr; `--json` also emits `{"input","error"}` for that line) |
 | any command, Ctrl-C | — | — | 130 |
 

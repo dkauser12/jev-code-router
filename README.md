@@ -42,7 +42,8 @@ jev --version
 先下载到本地再执行，方便自己看一眼脚本内容。要求：`python3` ≥ 3.9、`curl`、`tar`、`shasum` 或
 `sha256sum`。写入位置：技能文件夹（CLI + 内置 specs + 文档）到
 `${XDG_DATA_HOME:-~/.local/share}/jev/`，再把 `~/.local/bin/jev` 软链到其中的 `scripts/jev`。不
-碰 shell 配置文件，不需要 sudo，重复运行是安全的（幂等）。
+碰 shell 配置文件，不需要 sudo，重复运行是安全的（幂等）。下一步：运行 `jev auth set` 配置密钥（见
+第 3 节）。
 
 环境变量覆盖：`JEV_VERSION`（默认 `v0.1.1`）、`JEV_HOME`（技能文件夹位置）、`JEV_INSTALL_DIR`
 （软链位置，默认 `~/.local/bin`）、`JEV_ARCHIVE_DIR`（离线安装，指向已下载好压缩包+校验文件的目录）。
@@ -82,21 +83,48 @@ Agent。技能内置了 CLI（`scripts/jev`），首次使用时 Agent 按技能
 
 ## 3. 配置 OpenRouter 密钥
 
-在 [openrouter.ai/keys](https://openrouter.ai/keys) 创建一个密钥。二选一：
+推荐做法：在你自己的终端运行 `jev auth set`。输入不回显，密钥不经过聊天、命令行参数和 shell
+历史。没有 sk-or- 开头的密钥，先在 [openrouter.ai/keys](https://openrouter.ai/keys) 创建一个。
+
+```bash
+$ jev auth set
+OpenRouter API key（输入不回显）: 
+已保存到 ~/.config/jev/.env（权限 600）。运行 jev auth check 验证。
+
+$ jev auth status
+来源：配置文件 ~/.config/jev/.env
+文件：~/.config/jev/.env
+权限：600
+
+$ jev auth check
+密钥有效
+额度：无上限
+累计用量：0.12 USD
+```
+
+`auth status` 只报告来源、路径和权限（不是 600 时提示 `chmod 600`），`auth check` 联网校验（只读、不计费），
+两者都不打印密钥本身。
+
+CI 等非交互环境没有终端，用环境变量：
 
 ```sh
-# A. 环境变量（写进 shell 配置文件、密钥管理器，或 CI secret）
 export OPENROUTER_API_KEY=sk-or-...
+```
 
-# B. 配置文件
+也可以绕开 `auth set`，自己编辑文件：
+
+```sh
 mkdir -p ~/.config/jev && ${EDITOR:-vi} ~/.config/jev/.env
 # 写入一行：OPENROUTER_API_KEY=sk-or-...
 chmod 600 ~/.config/jev/.env
 ```
 
 查找顺序：环境变量 → `$JEV_ENV_FILE` → `~/.config/jev/.env`（`XDG_CONFIG_HOME` 可覆盖配置目录）。
-没有 `./.env`（当前目录）这一项——密钥属于用户，不属于某个仓库。永远不要把密钥贴进聊天，也不要当
-命令行参数传递。
+没有 `./.env`（当前目录）这一项——密钥属于用户，不属于某个仓库。
+
+**安全说明**：600 权限挡住的是其他系统用户；以你身份运行的任何程序——包括 AI agent——只要能读你能
+读的文件，就能读到这个密钥，`chmod` 挡不住这一层。`auth set` 保证的只是密钥不经过聊天、不经过命令
+行参数、不进 shell 历史。
 
 ## 4. 快速上手
 

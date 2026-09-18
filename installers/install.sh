@@ -138,13 +138,9 @@ main() {
   if [ -z "${OPENROUTER_API_KEY:-}" ]; then
     cfg_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/jev
     if [ ! -f "$cfg_dir/.env" ]; then
-      printf '\nNo OPENROUTER_API_KEY found. Create one at https://openrouter.ai/keys, then either\n'
-      printf 'export OPENROUTER_API_KEY from your shell profile or secret manager, or put it in a file\n'
-      printf 'with an editor (keeps the key out of shell history):\n'
-      # shellcheck disable=SC2016  # ${EDITOR:-vi} is literal text for the user to paste
-      printf '  mkdir -p "%s" && ${EDITOR:-vi} "%s/.env"   # add: OPENROUTER_API_KEY=sk-or-...\n' \
-        "$cfg_dir" "$cfg_dir"
-      printf '  chmod 600 "%s/.env"\n' "$cfg_dir"
+      printf '\nNext step: run "%s/jev" auth set in your own terminal to store an OpenRouter key\n' "$bin"
+      printf '(hidden input, never echoed; create a key first at https://openrouter.ai/keys).\n'
+      printf 'CI and other non-interactive environments can set OPENROUTER_API_KEY instead.\n'
     fi
   fi
 }

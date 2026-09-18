@@ -15,7 +15,7 @@ metadata:
 ## Setup
 
 1. Run `jev --version`. If the command is missing, the CLI ships with this skill at `scripts/jev` (Python 3.9+, standard library only). Link it with `mkdir -p ~/.local/bin && ln -sf "<this skill's directory>/scripts/jev" ~/.local/bin/jev`, or call it by its absolute path.
-2. The key is `OPENROUTER_API_KEY`, looked up in: environment → `$JEV_ENV_FILE` → `<config dir>/.env`, where config dir is `$XDG_CONFIG_HOME/jev` if set, else `~/.config/jev`. On HTTP 401 or `未找到 OPENROUTER_API_KEY`, ask the user to put the key in that `.env` file themselves. Never ask for the key in chat and never print it.
+2. The key is `OPENROUTER_API_KEY`, looked up in: environment → `$JEV_ENV_FILE` → `<config dir>/.env`, where config dir is `$XDG_CONFIG_HOME/jev` if set, else `~/.config/jev`. Run `jev auth status` to see which source is active and where, without printing the key. When it's missing, or `jev auth check` or a call returns HTTP 401, tell the user to run `jev auth set` in their own terminal — it prompts with hidden input and needs a real TTY, so an agent cannot run it on their behalf. `jev auth check` (free, read-only) is safe to run to confirm the fix worked. Never ask for the key in chat, never pass it as an argument, and never read or print the key file yourself.
 
 ## Choose the verb
 

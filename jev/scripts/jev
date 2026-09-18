@@ -13,12 +13,14 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import queue
 import random
 import re
 import socket
+import stat
 import sys
 import threading
 import time
@@ -35,6 +37,7 @@ except ImportError:  # Python < 3.11
 
 VERSION = "0.1.1"
 BASE_URL_DEFAULT = "https://openrouter.ai/api/alpha/decisions"
+KEY_URL_DEFAULT = "https://openrouter.ai/api/v1/key"
 DEFAULT_MODEL = "~typesafe/jev-latest"
 SIZE_WARN_TOKENS = 30000
 
@@ -88,25 +91,48 @@ def parse_env_file(path):
     return result
 
 
-def resolve_api_key():
+def default_env_path():
+    return os.path.join(config_dir(), ".env")
+
+
+def locate_api_key():
+    """单一查找实现，供决策调用、`auth status`、`auth check` 共用。
+
+    返回 (key, source, path)：
+      - 命中环境变量：("<key>", "env", None)
+      - 命中 $JEV_ENV_FILE：("<key>", "JEV_ENV_FILE", "<file 路径>")
+      - 命中配置目录 .env：("<key>", "config", "<file 路径>")
+      - 未命中：(None, None, "<配置目录 .env 的路径，供报错/提示使用>")
+    """
     key = os.environ.get("OPENROUTER_API_KEY")
     if key:
-        return key.strip()
+        return key.strip(), "env", None
+
+    default_env = default_env_path()
     candidates = []
     env_file = os.environ.get("JEV_ENV_FILE")
     if env_file:
-        candidates.append(env_file)
-    default_env = os.path.join(config_dir(), ".env")
-    candidates.append(default_env)
-    for path in candidates:
+        candidates.append(("JEV_ENV_FILE", env_file))
+    candidates.append(("config", default_env))
+
+    for source, path in candidates:
         if path and os.path.isfile(path):
             data = parse_env_file(path)
             v = data.get("OPENROUTER_API_KEY")
             if v:
-                return v.strip()
+                return v.strip(), source, path
+
+    return None, None, default_env
+
+
+def resolve_api_key():
+    key, _source, _path = locate_api_key()
+    if key:
+        return key
     raise JevError(
         "jev: 未找到 OPENROUTER_API_KEY。请设置环境变量，或在 $JEV_ENV_FILE 指向的文件"
-        f"或 {default_env} 中配置（配置目录可用 XDG_CONFIG_HOME 覆盖）。",
+        f"或 {default_env_path()} 中配置（配置目录可用 XDG_CONFIG_HOME 覆盖）。"
+        "在你自己的终端运行 jev auth set 可以交互式配置，密钥不会经过聊天或命令行参数。",
         2,
     )
 
@@ -137,6 +163,23 @@ def http_post(url, headers, payload, timeout):
         finally:
             e.close()
         return e.code, body, e.headers
+    except (urllib.error.URLError, socket.timeout, OSError) as e:
+        reason = getattr(e, "reason", e)
+        raise JevNetworkError(str(reason))
+
+
+def http_get(url, headers, timeout):
+    """`auth check` 专用：一次性 GET，不重试（这一路径不计费，出错直接报告）。"""
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        finally:
+            e.close()
+        return e.code, body
     except (urllib.error.URLError, socket.timeout, OSError) as e:
         reason = getattr(e, "reason", e)
         raise JevNetworkError(str(reason))
@@ -1050,6 +1093,207 @@ def cmd_raw(args):
 
 
 # --------------------------------------------------------------------------
+# 密钥管理 (auth)
+# --------------------------------------------------------------------------
+#
+# 目标：仓库既提供 CLI 安装，也提供一条让用户在自己终端里设置密钥的路径，密钥
+# 全程不经过 AI agent —— 不进聊天、不进命令行参数、不进 shell 历史。`auth set`
+# 因此拒绝在非交互终端下运行：agent 没有 TTY，本来就做不到替用户输入密钥。
+
+def _drop_key_lines(text):
+    """按行保留内容，丢弃已有的 OPENROUTER_API_KEY= / export OPENROUTER_API_KEY= 行。"""
+    kept = []
+    for line in text.splitlines():
+        bare = line[len("export "):] if line.startswith("export ") else line
+        name = bare.split("=", 1)[0].strip()
+        if name == "OPENROUTER_API_KEY":
+            continue
+        kept.append(line)
+    return kept
+
+
+def write_key_to_env_file(key):
+    """把 OPENROUTER_API_KEY 写进 <config dir>/.env，原子替换，返回实际写入的文件路径。
+
+    - 目标若是软链接，写到软链接指向的真实路径，软链接本身不变（依然指向它）。
+    - 保留文件中的其它行；已有的 OPENROUTER_API_KEY 行（含 export 形式）被替换。
+    - 临时文件建在目标所在目录、O_EXCL 独占创建，写完 flush+fsync 再 os.replace
+      做原子换入，不会留下半写状态；最后再强制 chmod 600（不依赖 umask）。
+    """
+    cfg_dir = config_dir()
+    os.makedirs(cfg_dir, mode=0o700, exist_ok=True)
+    target = os.path.join(cfg_dir, ".env")
+    real_target = os.path.realpath(target) if os.path.islink(target) else target
+    real_dir = os.path.dirname(real_target) or "."
+    os.makedirs(real_dir, mode=0o700, exist_ok=True)
+
+    try:
+        with open(real_target, "r", encoding="utf-8") as f:
+            existing = f.read()
+    except OSError:
+        existing = ""
+
+    lines = _drop_key_lines(existing)
+    lines.append(f"OPENROUTER_API_KEY={key}")
+    content = "\n".join(lines) + "\n"
+
+    tmp_path = os.path.join(real_dir, f".jev-env-{os.getpid()}-{int(time.time() * 1000)}.tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, real_target)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    os.chmod(real_target, 0o600)
+    return real_target
+
+
+def cmd_auth_set(args):
+    if not sys.stdin.isatty():
+        raise JevError(
+            "jev: auth set 需要在你自己的终端里交互运行（输入不回显）；"
+            "CI 等非交互环境请用 OPENROUTER_API_KEY 环境变量。",
+            2,
+        )
+    try:
+        raw = getpass.getpass("OpenRouter API key（输入不回显）: ")
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        raise JevError("jev: 已取消，未作更改。", 2)
+
+    key = raw.strip()
+    if not key:
+        raise JevError("jev: 未输入内容，未作更改。", 2)
+
+    if not key.startswith("sk-or-"):
+        print("jev: 警告：这不像是 OpenRouter 密钥（通常以 sk-or- 开头）。", file=sys.stderr)
+        try:
+            answer = input("继续保存吗？[y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            raise JevError("jev: 已取消，未作更改。", 2)
+
+    target = write_key_to_env_file(key)
+    print(f"已保存到 {target}（权限 600）。运行 jev auth check 验证。")
+    if os.environ.get("OPENROUTER_API_KEY"):
+        print("提示：环境变量 OPENROUTER_API_KEY 已设置，读取时优先于这个文件。", file=sys.stderr)
+    elif os.environ.get("JEV_ENV_FILE"):
+        print("提示：JEV_ENV_FILE 已设置，读取时优先于这个文件。", file=sys.stderr)
+    return 0
+
+
+def _permission_report(path):
+    lines = []
+    real = os.path.realpath(path) if os.path.islink(path) else path
+    if real != path:
+        lines.append(f"文件：{path} -> {real}（软链接）")
+    else:
+        lines.append(f"文件：{path}")
+    try:
+        mode = stat.S_IMODE(os.stat(real).st_mode)
+    except OSError as e:
+        lines.append(f"权限：无法读取 ({e})")
+        return lines
+    lines.append(f"权限：{mode:03o}")
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        lines.append(f"警告：其他系统用户可能可读此文件，建议 chmod 600 {real}")
+    return lines
+
+
+def cmd_auth_status(args):
+    key, source, path = locate_api_key()
+    if not key:
+        print(f"未配置 OPENROUTER_API_KEY。请在你自己的终端运行 jev auth set（写入 {path}）。")
+        return 1
+
+    if source == "env":
+        print("来源：环境变量 OPENROUTER_API_KEY")
+    elif source == "JEV_ENV_FILE":
+        print(f"来源：$JEV_ENV_FILE -> {path}")
+        for line in _permission_report(path):
+            print(line)
+    else:
+        print(f"来源：配置文件 {path}")
+        for line in _permission_report(path):
+            print(line)
+    return 0
+
+
+def _fmt_usd(x):
+    s = f"{x:.4f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def cmd_auth_check(args):
+    key, _source, path = locate_api_key()
+    if not key:
+        raise JevError(
+            "jev: 未找到 OPENROUTER_API_KEY。请设置环境变量，或在 $JEV_ENV_FILE 指向的文件"
+            f"或 {path} 中配置（配置目录可用 XDG_CONFIG_HOME 覆盖）。"
+            "在你自己的终端运行 jev auth set 可以交互式配置。",
+            2,
+        )
+
+    url = os.environ.get("JEV_KEY_URL") or KEY_URL_DEFAULT
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "X-Title": "jev-cli",
+        "HTTP-Referer": "https://github.com/okooo5km/jev",
+    }
+    try:
+        status, body = http_get(url, headers, timeout=15)
+    except JevNetworkError as e:
+        raise JevError(f"jev: 网络错误: {e}", 2)
+
+    if status == 401:
+        raise JevError("jev: 密钥无效（HTTP 401），请在你自己的终端运行 jev auth set 重新设置", 2)
+    if status != 200:
+        raise JevError(format_api_error(status, body), 2)
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise JevError("jev: 响应不是合法 JSON", 2)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise JevError("jev: 响应格式异常，缺少 data 字段", 2)
+
+    # 绝不打印 label（无标签 key 的 label 会带一段脱敏后的密钥片段）或
+    # creator_user_id（账号标识）——两者都不该出现在 CLI 输出里。
+    print("密钥有效")
+    limit = data.get("limit")
+    if limit is None:
+        print("额度：无上限")
+    else:
+        remaining = data.get("limit_remaining")
+        if isinstance(remaining, (int, float)):
+            print(f"额度：{_fmt_usd(limit)} USD，剩余 {_fmt_usd(remaining)} USD")
+        else:
+            print(f"额度：{_fmt_usd(limit)} USD")
+    usage = data.get("usage")
+    if isinstance(usage, (int, float)):
+        print(f"累计用量：{_fmt_usd(usage)} USD")
+    return 0
+
+
+def cmd_auth(args):
+    verb = getattr(args, "auth_verb", None)
+    handlers = {"set": cmd_auth_set, "status": cmd_auth_status, "check": cmd_auth_check}
+    if verb not in handlers:
+        raise JevError("jev: 请指定 auth 子命令 (set/status/check)", 2)
+    return handlers[verb](args)
+
+
+# --------------------------------------------------------------------------
 # 参数解析
 # --------------------------------------------------------------------------
 
@@ -1121,6 +1365,12 @@ def build_parser():
     p_raw.add_argument("--retries", type=int, default=3, help="失败重试次数（默认 3）")
     p_raw.add_argument("--verbose", action="store_true", help="在 stderr 输出耗时/token/费用统计")
 
+    p_auth = sub.add_parser("auth", help="管理 OPENROUTER_API_KEY（set/status/check）")
+    auth_sub = p_auth.add_subparsers(dest="auth_verb", help="auth 子命令")
+    auth_sub.add_parser("set", help="在你自己的终端交互设置密钥（输入不回显，需要 TTY）")
+    auth_sub.add_parser("status", help="查看密钥来源、文件路径与权限；不打印密钥")
+    auth_sub.add_parser("check", help="联网校验密钥是否有效（只读，不计费）")
+
     return parser
 
 
@@ -1139,12 +1389,12 @@ def main(argv=None):
     verb = getattr(args, "verb", None)
     if not verb:
         parser.print_usage(sys.stderr)
-        print("jev: 请指定子命令 (yes/pick/score/filter/run/raw)，或使用 --version", file=sys.stderr)
+        print("jev: 请指定子命令 (yes/pick/score/filter/run/raw/auth)，或使用 --version", file=sys.stderr)
         return 2
 
     handlers = {
         "yes": cmd_yes, "pick": cmd_pick, "score": cmd_score,
-        "filter": cmd_filter, "run": cmd_run, "raw": cmd_raw,
+        "filter": cmd_filter, "run": cmd_run, "raw": cmd_raw, "auth": cmd_auth,
     }
     try:
         return handlers[verb](args)
