@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl --proto '=https' --tlsv1.2 -fLsS \
-#     https://github.com/okooo5km/jev/releases/download/v0.1.0/install.sh -o /tmp/jev-install.sh
+#     https://github.com/okooo5km/jev/releases/download/v0.1.1/install.sh -o /tmp/jev-install.sh
 #   sh /tmp/jev-install.sh
 #
 # Env overrides: JEV_VERSION, JEV_HOME, JEV_INSTALL_DIR, JEV_ARCHIVE_DIR.
@@ -13,7 +13,7 @@
 set -eu
 
 main() {
-  version=${JEV_VERSION:-v0.1.0}
+  version=${JEV_VERSION:-v0.1.1}
   case "$version" in
     v[0-9]*.[0-9]*.[0-9]*) ;;
     *)

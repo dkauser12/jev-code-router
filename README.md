@@ -33,7 +33,7 @@ is_promo     no          p=0.09
 ## 1. 安装 CLI（macOS / Linux）
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fLsS https://github.com/okooo5km/jev/releases/download/v0.1.0/install.sh -o /tmp/jev-install.sh
+curl --proto '=https' --tlsv1.2 -fLsS https://github.com/okooo5km/jev/releases/download/v0.1.1/install.sh -o /tmp/jev-install.sh
 sh /tmp/jev-install.sh
 export PATH="$HOME/.local/bin:$PATH"
 jev --version
@@ -44,14 +44,14 @@ jev --version
 `${XDG_DATA_HOME:-~/.local/share}/jev/`，再把 `~/.local/bin/jev` 软链到其中的 `scripts/jev`。不
 碰 shell 配置文件，不需要 sudo，重复运行是安全的（幂等）。
 
-环境变量覆盖：`JEV_VERSION`（默认 `v0.1.0`）、`JEV_HOME`（技能文件夹位置）、`JEV_INSTALL_DIR`
+环境变量覆盖：`JEV_VERSION`（默认 `v0.1.1`）、`JEV_HOME`（技能文件夹位置）、`JEV_INSTALL_DIR`
 （软链位置，默认 `~/.local/bin`）、`JEV_ARCHIVE_DIR`（离线安装，指向已下载好压缩包+校验文件的目录）。
 
 手动安装：从 [Releases](https://github.com/okooo5km/jev/releases/latest) 下载
 `jev-vX.Y.Z.tar.gz`、对应的 `.sha256` 和 `install.sh`，放在同一目录，校验后离线安装：
 
 ```sh
-shasum -a 256 -c jev-v0.1.0.tar.gz.sha256
+shasum -a 256 -c jev-v0.1.1.tar.gz.sha256
 JEV_ARCHIVE_DIR=. sh install.sh
 ```
 
@@ -188,8 +188,8 @@ false = "可以排期"
 ```sh
 python3 -m unittest discover -s tests -v      # 离线，纯标准库，不需要真实密钥
 shellcheck -s sh installers/install.sh .github/package.sh
-sh .github/package.sh v0.1.0                  # 产出 dist/jev-v0.1.0.tar.gz(.sha256)
-gh release create v0.1.0 dist/* installers/install.sh
+sh .github/package.sh vX.Y.Z                  # 产出 dist/jev-vX.Y.Z.tar.gz(.sha256)
+gh release create vX.Y.Z dist/* installers/install.sh
 ```
 
 ## 许可

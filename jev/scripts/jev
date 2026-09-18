@@ -33,7 +33,7 @@ try:
 except ImportError:  # Python < 3.11
     tomllib = None
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 BASE_URL_DEFAULT = "https://openrouter.ai/api/alpha/decisions"
 DEFAULT_MODEL = "~typesafe/jev-latest"
 SIZE_WARN_TOKENS = 30000

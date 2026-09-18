@@ -34,7 +34,7 @@ is_promo     no          p=0.09
 ## 1. Install the CLI (macOS / Linux)
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fLsS https://github.com/okooo5km/jev/releases/download/v0.1.0/install.sh -o /tmp/jev-install.sh
+curl --proto '=https' --tlsv1.2 -fLsS https://github.com/okooo5km/jev/releases/download/v0.1.1/install.sh -o /tmp/jev-install.sh
 sh /tmp/jev-install.sh
 export PATH="$HOME/.local/bin:$PATH"
 jev --version
@@ -45,7 +45,7 @@ Downloaded first so you can inspect it before running. Requirements: `python3` >
 `${XDG_DATA_HOME:-~/.local/share}/jev/`, then symlinks `~/.local/bin/jev` to `scripts/jev` inside
 it. No shell profile edits, no sudo, safe to run again (idempotent).
 
-Env overrides: `JEV_VERSION` (default `v0.1.0`), `JEV_HOME` (skill folder location),
+Env overrides: `JEV_VERSION` (default `v0.1.1`), `JEV_HOME` (skill folder location),
 `JEV_INSTALL_DIR` (symlink location, default `~/.local/bin`), `JEV_ARCHIVE_DIR` (offline install,
 a directory already holding the downloaded archive and checksum).
 
@@ -53,7 +53,7 @@ Manual install: download `jev-vX.Y.Z.tar.gz`, its `.sha256` and `install.sh` fro
 [Releases](https://github.com/okooo5km/jev/releases/latest) into one directory, verify, then install offline:
 
 ```sh
-shasum -a 256 -c jev-v0.1.0.tar.gz.sha256
+shasum -a 256 -c jev-v0.1.1.tar.gz.sha256
 JEV_ARCHIVE_DIR=. sh install.sh
 ```
 
@@ -196,8 +196,8 @@ whatever survives the filter is still on you.
 ```sh
 python3 -m unittest discover -s tests -v      # offline, stdlib only, no real key needed
 shellcheck -s sh installers/install.sh .github/package.sh
-sh .github/package.sh v0.1.0                  # produces dist/jev-v0.1.0.tar.gz(.sha256)
-gh release create v0.1.0 dist/* installers/install.sh
+sh .github/package.sh vX.Y.Z                  # produces dist/jev-vX.Y.Z.tar.gz(.sha256)
+gh release create vX.Y.Z dist/* installers/install.sh
 ```
 
 ## License

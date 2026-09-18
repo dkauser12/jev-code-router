@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -14,7 +15,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE_SH = REPO_ROOT / ".github" / "package.sh"
 INSTALL_SH = REPO_ROOT / "installers" / "install.sh"
-VERSION = "v0.1.0"
+# The CLI's VERSION is the source of truth; test_versioning keeps the others in sync.
+CLI_VERSION = re.search(
+    r'^VERSION = "([^"]+)"',
+    (REPO_ROOT / "jev" / "scripts" / "jev").read_text(encoding="utf-8"),
+    re.M,
+).group(1)
+VERSION = f"v{CLI_VERSION}"
 ARCHIVE_NAME = f"jev-{VERSION}.tar.gz"
 
 
@@ -105,7 +112,7 @@ class PackageAndInstallTests(unittest.TestCase):
             timeout=60,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("jev 0.1.0", proc.stdout)
+        self.assertIn(f"jev {CLI_VERSION}", proc.stdout)
 
         installed_bin = self.home / ".local" / "bin" / "jev"
         self.assertTrue(installed_bin.is_symlink())
@@ -118,7 +125,7 @@ class PackageAndInstallTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(version_proc.returncode, 0)
-        self.assertEqual(version_proc.stdout.strip(), "jev 0.1.0")
+        self.assertEqual(version_proc.stdout.strip(), f"jev {CLI_VERSION}")
 
         run_proc = subprocess.run(
             [str(installed_bin), "run"],
