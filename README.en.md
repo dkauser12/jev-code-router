@@ -34,7 +34,7 @@ is_promo     no          p=0.09
 ## 1. Install the CLI (macOS / Linux)
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fLsS https://github.com/okooo5km/jev/releases/download/v0.2.0/install.sh -o /tmp/jev-install.sh
+curl --proto '=https' --tlsv1.2 -fLsS https://github.com/okooo5km/jev/releases/download/v0.2.1/install.sh -o /tmp/jev-install.sh
 sh /tmp/jev-install.sh
 export PATH="$HOME/.local/bin:$PATH"
 jev --version
@@ -46,7 +46,7 @@ Downloaded first so you can inspect it before running. Requirements: `python3` >
 it. No shell profile edits, no sudo, safe to run again (idempotent). Next step: run `jev auth set`
 to configure a key (section 3).
 
-Env overrides: `JEV_VERSION` (default `v0.2.0`), `JEV_HOME` (skill folder location),
+Env overrides: `JEV_VERSION` (default `v0.2.1`), `JEV_HOME` (skill folder location),
 `JEV_INSTALL_DIR` (symlink location, default `~/.local/bin`), `JEV_ARCHIVE_DIR` (offline install,
 a directory already holding the downloaded archive and checksum).
 
@@ -54,7 +54,7 @@ Manual install: download `jev-vX.Y.Z.tar.gz`, its `.sha256` and `install.sh` fro
 [Releases](https://github.com/okooo5km/jev/releases/latest) into one directory, verify, then install offline:
 
 ```sh
-shasum -a 256 -c jev-v0.2.0.tar.gz.sha256
+shasum -a 256 -c jev-v0.2.1.tar.gz.sha256
 JEV_ARCHIVE_DIR=. sh install.sh
 ```
 
