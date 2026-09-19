@@ -33,7 +33,7 @@ is_promo     no          p=0.09
 ## 1. 安装 CLI（macOS / Linux）
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fLsS https://github.com/okooo5km/jev/releases/download/v0.2.1/install.sh -o /tmp/jev-install.sh
+curl --proto '=https' --tlsv1.2 -fLsS https://github.com/okooo5km/jev/releases/download/v0.3.0/install.sh -o /tmp/jev-install.sh
 sh /tmp/jev-install.sh
 export PATH="$HOME/.local/bin:$PATH"
 jev --version
@@ -45,14 +45,14 @@ jev --version
 碰 shell 配置文件，不需要 sudo，重复运行是安全的（幂等）。下一步：运行 `jev auth set` 配置密钥（见
 第 3 节）。
 
-环境变量覆盖：`JEV_VERSION`（默认 `v0.2.1`）、`JEV_HOME`（技能文件夹位置）、`JEV_INSTALL_DIR`
+环境变量覆盖：`JEV_VERSION`（默认 `v0.3.0`）、`JEV_HOME`（技能文件夹位置）、`JEV_INSTALL_DIR`
 （软链位置，默认 `~/.local/bin`）、`JEV_ARCHIVE_DIR`（离线安装，指向已下载好压缩包+校验文件的目录）。
 
 手动安装：从 [Releases](https://github.com/okooo5km/jev/releases/latest) 下载
 `jev-vX.Y.Z.tar.gz`、对应的 `.sha256` 和 `install.sh`，放在同一目录，校验后离线安装：
 
 ```sh
-shasum -a 256 -c jev-v0.2.1.tar.gz.sha256
+shasum -a 256 -c jev-v0.3.0.tar.gz.sha256
 JEV_ARCHIVE_DIR=. sh install.sh
 ```
 
