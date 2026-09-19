@@ -133,6 +133,26 @@ class RunCustomSpecTests(JevTestCase):
             self.assertEqual(mock.request_count, 0)
 
 
+    def test_score_criteria_written_as_a_map_gets_a_shape_error(self):
+        spec = {
+            "description": "score criteria as a map",
+            "questions": {
+                "novelty": {
+                    "type": "score",
+                    "instructions": "how novel",
+                    "criteria": {"low": "old news", "mid": "some", "high": "first"},
+                }
+            },
+        }
+        (self.user_specs_dir() / "scoremap.json").write_text(json.dumps(spec), encoding="utf-8")
+        with MockDecisionsServer() as mock:
+            env = self.base_env(JEV_BASE_URL=mock.base_url)
+            proc = self.run_jev(["run", "scoremap", "-s", "SCORE=1"], env=env)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("必须是数组", proc.stderr)
+            self.assertNotIn("2-10", proc.stderr)
+            self.assertEqual(mock.request_count, 0)
+
 class RawTests(JevTestCase):
     def test_raw_echoes_api_response(self):
         with MockDecisionsServer() as mock:

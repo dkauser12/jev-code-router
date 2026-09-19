@@ -250,11 +250,15 @@ being dropped. A yes/no question's descriptions go inside `criteria`, with both 
 state plus the longest question under ~32K; rate limit about 1,200 requests/minute. **OpenRouter:**
 the same Jev model, response carries its own `usage.cost`; documented context is 32K; the endpoint
 is OpenRouter's alpha API `https://openrouter.ai/api/alpha/decisions` and may change -- override
-with `JEV_BASE_URL` if it does. Latency: TypeSafe documents 70-500ms; measured from mainland China
-it was about 1 second on both backends, and concurrent calls did not add up linearly. Common to
-both: `score` allows at most 10 levels (an API limit); keep `-j`/line-mode concurrency at 16 or
-below. Jev only decides -- it never generates text, so reading, writing or summarizing whatever
-survives the filter is still on you.
+with `JEV_BASE_URL` if it does. Speed: a single call opens a new connection, so it pays connection
+setup on top of model time -- typically 0.5-1s total. Line mode (`-l`/`filter`/`run -l`) keeps each
+worker's connection open, so every call after the first is about 0.3-0.4s, in line with TypeSafe's
+documented 70-500ms -- measured on 40 lines with `-j 4`: about 4s reusing connections versus about
+7.5s reconnecting every time. For more than a handful of items, use line mode instead of looping
+single calls in a shell; put several questions about the same input into one spec (one call answers
+them all); raise `-j` for large batches (default 8, keep at or below 16). `score` allows at most 10
+levels (an API limit). Jev only decides -- it never generates text, so reading, writing or
+summarizing whatever survives the filter is still on you.
 
 ## 8. Development and verification
 

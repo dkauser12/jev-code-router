@@ -145,7 +145,7 @@ jev auth remove [--provider typesafe|openrouter]
 | `--provider typesafe\|openrouter` | all but `auth` (which has it per subcommand) | Selects the backend for this call. See Providers above for resolution order. |
 | `--timeout SECONDS` | all | Per-request timeout. Default 60. |
 | `--retries N` | all | Retries for 429/5xx/network errors, exponential backoff with jitter, `Retry-After` respected. Default 3. |
-| `--verbose` | all | stderr: provider, model, latency, tokens, cost (`≈$` when the provider estimates rather than reports cost; line mode: one summary at the end). |
+| `--verbose` | all | stderr: provider, model, latency, tokens, cost (`≈$` when the provider estimates rather than reports cost; line mode: one summary at the end, plus connection counts — `连接 新建 N / 复用 M`). |
 | `--version` | — | Print `jev X.Y.Z` and exit. |
 
 State auto-detection (without `--text`): if the trimmed input starts with `{` or `[` and parses as JSON, it is sent as a structured `state` (object or array); otherwise it is sent as a string.
@@ -164,11 +164,21 @@ State auto-detection (without `--text`): if the trimmed input starts with `{` or
 | `JEV_BASE_URL` | Overrides the decisions endpoint of the **active** provider (default per the Providers table above); used by this project's own tests, and useful if an endpoint moves. |
 | `JEV_KEY_URL` | Overrides the `auth check` endpoint of the active provider (same defaults as the Providers table). |
 | `XDG_CONFIG_HOME` | Overrides the config dir's parent (default `~/.config`); the config dir is `$XDG_CONFIG_HOME/jev` or `~/.config/jev`. |
-| `JEV_DEBUG=1` | Print each outgoing request body to stderr. Never prints a key. |
+| `JEV_DEBUG=1` | Print each outgoing request body to stderr, plus one line per request saying whether the connection was reused. Never prints a key. |
 
 Key lookup order (per provider): environment (`TYPESAFE_API_KEY` or `OPENROUTER_API_KEY`) → `$JEV_ENV_FILE` → `<config dir>/.env`. There is no repository-local `./.env` lookup — a key belongs to the user, not a checkout.
 
 **Two files, deliberately separate** (same split as `gh`'s `hosts.yml`/`config.yml`, AWS's `credentials`/`config`, `llm`'s `keys.json`): `<config dir>/.env` holds secrets only — a plain `KEY=value` file, one line per key, mode `600`, written by `jev auth set` / `jev auth remove`. `<config dir>/config.ini` holds non-secret settings only — currently just `[jev]` `provider = typesafe|openrouter`, mode `644`, written by `jev provider default`, parsed with `configparser`. Neither file should normally be hand-edited; `jev auth status` and `jev provider list` report what's active without printing a key.
+
+## Speed
+
+A single call opens a new connection, so it pays connection setup on top of model time — typically
+0.5–1 s in total. Line mode (`-l`, `filter`, `run -l`) keeps each worker's connection open, so every
+call after the first takes about 0.3–0.4 s, in line with TypeSafe's documented 70–500 ms; measured on
+40 lines with `-j 4`, about 4 s versus about 7.5 s reconnecting every time. For more than a handful of
+items, use line mode instead of looping single calls in a shell; put several questions about the same
+input into one spec (one call answers them all); raise `-j` (default 8, keep at or below 16) for
+large batches. `--verbose` reports the connection counts in line mode: `连接 新建 N / 复用 M`.
 
 ## Exit codes
 

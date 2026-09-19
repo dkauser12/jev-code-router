@@ -13,14 +13,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
+import errno
 import getpass
+import http.client
+import ipaddress
 import json
 import os
 import queue
 import random
 import re
 import socket
+import ssl
 import stat
 import sys
 import threading
@@ -351,24 +356,208 @@ def provider_headers(provider, api_key, content_type=False):
 
 
 # --------------------------------------------------------------------------
-# HTTP + 重试
+# HTTP + 连接复用 + 重试
 # --------------------------------------------------------------------------
+#
+# 决策请求 (POST) 走这里的连接池：每个 (线程, scheme, host, port) 一条 http.client
+# 连接，线程本地存储，跨请求复用。`auth check` 的 GET 调用量小，留在 urllib 上。
 
-def http_post(url, headers, payload, timeout):
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+_conn_local = threading.local()
+_conn_registry_lock = threading.Lock()
+_conn_registry = []  # 所有线程各自的连接池 dict；逐行模式跑完后统一关闭用
+
+_conn_stats_lock = threading.Lock()
+_conn_stats = {"new": 0, "reused": 0}
+
+# 复用连接上遇到这些错误，且是在拿到任何响应字节之前失败的，说明连接已经失效（比如
+# 服务端悄悄断开了空闲连接），不算真正的网络故障：丢弃后立刻用新连接重试一次，不占
+# --retries 名额、不 backoff（decision POST 没有副作用，重放是安全的）。
+_STALE_CONN_ERRNOS = {errno.EPIPE, errno.ECONNRESET}
+
+
+def _record_conn_stat(is_new):
+    with _conn_stats_lock:
+        _conn_stats["new" if is_new else "reused"] += 1
+
+
+def get_conn_stats():
+    with _conn_stats_lock:
+        return dict(_conn_stats)
+
+
+def _conn_pool():
+    pool = getattr(_conn_local, "pool", None)
+    if pool is None:
+        pool = {}
+        _conn_local.pool = pool
+        with _conn_registry_lock:
+            _conn_registry.append(pool)
+    return pool
+
+
+def close_all_connections():
+    """尽力关闭所有线程的连接池，供逐行模式正常跑完后调用清理 fd。只做
+    best-effort：关闭失败忽略，从不因为这一步耗时而拖住退出——Ctrl-C 走
+    os._exit(130)，根本不会执行到这里，不受影响。"""
+    with _conn_registry_lock:
+        pools = list(_conn_registry)
+    for pool in pools:
+        for key in list(pool.keys()):
+            conn = pool.pop(key, None)
+            if conn is None:
+                continue
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _is_loopback_host(host):
+    h = (host or "").strip("[]")
+    if h.lower() == "localhost":
+        return True
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.getcode(), resp.read().decode("utf-8", "replace"), resp.headers
-    except urllib.error.HTTPError as e:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def resolve_proxy(scheme, host):
+    """沿用系统/环境的网络设置，和 urllib 的行为一致；返回 (host, port, user,
+    password) 或 None（直连）。"""
+    if _is_loopback_host(host) or urllib.request.proxy_bypass(host):
+        return None
+    proxy_url = urllib.request.getproxies().get(scheme)
+    if not proxy_url:
+        return None
+    p = urlparse(proxy_url)
+    if p.scheme != "http" or not p.hostname:
+        return None
+    return p.hostname, p.port or 80, p.username, p.password
+
+
+def _basic_auth_header(user, password):
+    token = base64.b64encode(f"{user}:{password or ''}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def _parse_target(url):
+    parsed = urlparse(url)
+    scheme = parsed.scheme
+    host = parsed.hostname
+    if not host or scheme not in ("http", "https"):
+        raise JevError(f"jev: URL 无效: {url}", 2)
+    port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    return scheme, host, port, path
+
+
+def _new_connection(scheme, host, port, timeout, proxy):
+    if scheme != "https":
+        return http.client.HTTPConnection(host, port, timeout=timeout)
+    ctx = ssl.create_default_context()
+    if proxy is None:
+        return http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+    p_host, p_port, p_user, p_pass = proxy
+    conn = http.client.HTTPSConnection(p_host, p_port, timeout=timeout, context=ctx)
+    tunnel_headers = {"Proxy-Authorization": _basic_auth_header(p_user, p_pass)} if p_user else None
+    conn.set_tunnel(host, port, headers=tunnel_headers)
+    return conn
+
+
+def _is_stale_conn_error(e):
+    if isinstance(
+        e,
+        (
+            http.client.RemoteDisconnected,
+            ConnectionResetError,
+            BrokenPipeError,
+            ssl.SSLEOFError,
+            http.client.CannotSendRequest,
+        ),
+    ):
+        return True
+    return isinstance(e, OSError) and getattr(e, "errno", None) in _STALE_CONN_ERRNOS
+
+
+def _should_close_after(resp):
+    conn_header = (resp.headers.get("Connection") or "").lower()
+    if "close" in conn_header:
+        return True
+    return resp.version == 10 and "keep-alive" not in conn_header
+
+
+def http_post(url, headers, payload, timeout, debug=False):
+    data = json.dumps(payload).encode("utf-8")
+    scheme, host, port, path = _parse_target(url)
+    proxy = resolve_proxy(scheme, host)
+    pool = _conn_pool()
+    key = (scheme, host, port, proxy)
+
+    conn = pool.get(key)
+    is_new = conn is None
+    if is_new:
+        conn = _new_connection(scheme, host, port, timeout, proxy)
+
+    if debug:
+        print(f"[jev][debug] connection: {'new' if is_new else 'reused'}", file=sys.stderr)
+    _record_conn_stat(is_new)
+
+    req_headers = dict(headers)
+    req_headers["Content-Length"] = str(len(data))
+    try:
+        conn.request("POST", path, body=data, headers=req_headers)
+        resp = conn.getresponse()
+    except Exception as e:
+        if not is_new and _is_stale_conn_error(e):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            pool.pop(key, None)
+            conn = _new_connection(scheme, host, port, timeout, proxy)
+            if debug:
+                print("[jev][debug] connection: new (上一条复用连接已失效，重试一次)", file=sys.stderr)
+            _record_conn_stat(True)
+            try:
+                conn.request("POST", path, body=data, headers=req_headers)
+                resp = conn.getresponse()
+            except Exception as e2:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise JevNetworkError(str(e2))
+        else:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            pool.pop(key, None)
+            raise JevNetworkError(str(e))
+
+    try:
+        body_bytes = resp.read()
+    except Exception as e:
         try:
-            body = e.read().decode("utf-8", "replace")
-        finally:
-            e.close()
-        return e.code, body, e.headers
-    except (urllib.error.URLError, socket.timeout, OSError) as e:
-        reason = getattr(e, "reason", e)
-        raise JevNetworkError(str(reason))
+            conn.close()
+        except Exception:
+            pass
+        pool.pop(key, None)
+        raise JevNetworkError(str(e))
+
+    if _should_close_after(resp):
+        try:
+            conn.close()
+        except Exception:
+            pass
+        pool.pop(key, None)
+    else:
+        pool[key] = conn
+
+    return resp.status, body_bytes.decode("utf-8", "replace"), resp.headers
 
 
 def http_get(url, headers, timeout):
@@ -514,7 +703,7 @@ def call_api_payload(ctx, payload):
     while True:
         attempt += 1
         try:
-            status, body, hdrs = http_post(ctx.base_url, headers, payload, ctx.timeout)
+            status, body, hdrs = http_post(ctx.base_url, headers, payload, ctx.timeout, debug=ctx.debug)
         except JevNetworkError as e:
             if attempt > ctx.retries:
                 raise JevError(f"jev: 网络错误: {e}", 2)
@@ -830,7 +1019,12 @@ def validate_spec(data, path):
                 raise JevError(f"jev: spec 格式错误 {path}: questions.{name}.criteria 至少需要两个选项", 2)
         elif qtype == "score":
             crit = q.get("criteria")
-            if not isinstance(crit, list) or not (2 <= len(crit) <= 10):
+            if not isinstance(crit, list):
+                raise JevError(
+                    f"jev: spec 格式错误 {path}: questions.{name}.criteria 必须是数组，按从低到高列出各等级，"
+                    '例如 ["低", "中", "高"]（choice 和 noul 才用 {名称: 描述} 的写法）', 2
+                )
+            if not (2 <= len(crit) <= 10):
                 raise JevError(f"jev: spec 格式错误 {path}: questions.{name}.criteria 需要 2-10 个等级", 2)
         elif qtype == "noul":
             crit = q.get("criteria")
@@ -905,9 +1099,11 @@ def _print_line_summary(args, ctx, stats, t_start):
         return
     wall = time.time() - t_start
     prefix = "≈" if PROVIDERS[ctx.provider]["price_per_mtok"] else ""
+    conn = get_conn_stats()
     print(
         f"[jev] {ctx.provider} · 共 {stats['calls']} 次调用 · 失败 {stats['failures']} 次 · "
-        f"{stats['tokens']} tok · {prefix}${stats['cost']:.6f} · 耗时 {wall:.2f}s",
+        f"{stats['tokens']} tok · {prefix}${stats['cost']:.6f} · 耗时 {wall:.2f}s · "
+        f"连接 新建 {conn['new']} / 复用 {conn['reused']}",
         file=sys.stderr,
     )
 
@@ -996,6 +1192,10 @@ def iter_line_results(args, ctx, questions, stats):
         raise
     else:
         ex.shutdown(wait=True)
+        try:
+            close_all_connections()
+        except Exception:
+            pass
 
 
 def run_line_mode(args, ctx, questions, value_fn, json_enrich):

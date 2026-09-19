@@ -180,6 +180,14 @@ class MockDecisionsServer:
         with self._lock:
             return len(self._requests)
 
+    @property
+    def connection_count(self):
+        """Number of distinct client TCP connections seen so far, counted by
+        distinct (ip, port) client socket addresses -- a fresh local
+        ephemeral port each time the client opens a new connection."""
+        with self._lock:
+            return len({r["client_addr"] for r in self._requests if r.get("client_addr")})
+
     def retry_seen_before(self, key):
         with self._lock:
             seen = key in self._retry_seen
@@ -311,6 +319,15 @@ def _make_handler(server):
         def log_message(self, fmt, *args):  # noqa: A003 - stdlib signature
             pass  # keep test output clean; inspect server.requests instead
 
+        def _next_conn_seq(self):
+            # One handler instance serves every request on a kept-alive
+            # connection (BaseHTTPRequestHandler.handle() loops calling
+            # handle_one_request() on the same instance), so a plain instance
+            # attribute counts requests per TCP connection.
+            n = getattr(self, "_conn_seq", 0) + 1
+            self._conn_seq = n
+            return n
+
         def _send_json(self, status, body_dict, extra_headers=None):
             payload = json.dumps(body_dict).encode("utf-8")
             self.send_response(status)
@@ -321,6 +338,24 @@ def _make_handler(server):
             self.end_headers()
             self.wfile.write(payload)
 
+        def _conn_trigger_flags(self, state):
+            """Connection-behavior triggers matched against a plain-string
+            `state`, checked separately from the canned-answer/error triggers
+            above so they can apply on top of a normal 200 answer:
+              TRIGGER_STALE_CLOSE  -- close the socket right after responding,
+                                      WITHOUT a Connection: close header, to
+                                      simulate a server that silently dropped
+                                      an idle pooled connection.
+              TRIGGER_CONN_CLOSE   -- respond with an explicit
+                                      Connection: close header.
+            Returns (extra_headers, force_close_after_send)."""
+            if isinstance(state, str):
+                if state.startswith("TRIGGER_STALE_CLOSE"):
+                    return {}, True
+                if state.startswith("TRIGGER_CONN_CLOSE"):
+                    return {"Connection": "close"}, False
+            return {}, False
+
         def do_GET(self):  # noqa: N802 - stdlib method name
             auth = self.headers.get("Authorization", "")
             server.log({
@@ -328,6 +363,8 @@ def _make_handler(server):
                 "method": "GET",
                 "headers": {k.lower(): v for k, v in self.headers.items()},
                 "body": None,
+                "conn_seq": self._next_conn_seq(),
+                "client_addr": self.client_address,
             })
 
             if self.path == server.native_models_path:
@@ -399,12 +436,15 @@ def _make_handler(server):
                 name: _canned_answer(q, state)
                 for name, q in body["questions"].items()
             }
+            extra_headers, force_close = self._conn_trigger_flags(state)
             # Native response: no id, no usage.cost, no provider field.
             self._send_json(200, {
                 "model": body["model"],
                 "answers": answers,
                 "usage": {"input_tokens": 50, "output_tokens": 5},
-            })
+            }, extra_headers=extra_headers or None)
+            if force_close:
+                self.close_connection = True
 
         def do_POST(self):  # noqa: N802 - stdlib method name
             length = int(self.headers.get("Content-Length") or 0)
@@ -424,6 +464,12 @@ def _make_handler(server):
                 # headers means the wire casing isn't reliably "X-Title" etc.
                 "headers": {k.lower(): v for k, v in self.headers.items()},
                 "body": body,
+                # (ip, port) of the client's TCP connection -- a fresh local
+                # ephemeral port each time the client opens a new connection,
+                # so tests can count distinct connections by counting distinct
+                # values here (or via conn_seq below, which resets per socket).
+                "conn_seq": self._next_conn_seq(),
+                "client_addr": self.client_address,
             })
 
             if self.path == server.native_decisions_path:
@@ -482,11 +528,14 @@ def _make_handler(server):
                 name: _canned_answer(q, state)
                 for name, q in body["questions"].items()
             }
+            extra_headers, force_close = self._conn_trigger_flags(state)
             self._send_json(200, {
                 "id": "mock-decision-0",
                 "model": body["model"],
                 "answers": answers,
                 "usage": {"input_tokens": 50, "output_tokens": 5, "cost": 0.00002},
-            })
+            }, extra_headers=extra_headers or None)
+            if force_close:
+                self.close_connection = True
 
     return Handler
