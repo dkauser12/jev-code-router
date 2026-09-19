@@ -4,13 +4,13 @@
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue)](jev/scripts/jev)
 
-**Typed decisions with calibrated probabilities, from the shell — `yes`/`pick`/`score` over TypeSafe Jev via OpenRouter. CLI + Agent Skill.**
+**Typed decisions with calibrated probabilities, from the shell — `yes`/`pick`/`score` over TypeSafe Jev, via TypeSafe's own API by default or OpenRouter. CLI + Agent Skill.**
 
 [中文](README.md) · English
 
-`jev` is an unofficial community wrapper and supports only the OpenRouter backend; it has no
-affiliation with TypeSafe or OpenRouter. Single file, standard library only, Python 3.9+. One call
-takes about 1 second and costs about $0.00002.
+`jev` is an unofficial community wrapper supporting two backends: TypeSafe's own API (default) and
+OpenRouter; it has no affiliation with TypeSafe or OpenRouter. Single file, standard library only,
+Python 3.9+.
 
 By **okooo5km(十里)**. [More skills](https://sink.5km.tech/skills).
 
@@ -78,53 +78,84 @@ Node.js is only needed for this installer, not for the CLI itself. Add `-a claud
 to target specific agents. The skill bundles the CLI at `scripts/jev`; an agent links it onto PATH
 on first use. Update with `npx skills update jev -g`, remove with `npx skills remove jev -g`.
 
+TypeSafe also publishes its own Agent Skill (`npx skills add typesafe-ai/skills --skill
+typesafe-ai`) for building TypeSafe into your own application code -- that's about designing an
+integration. `jev` is different: no code to write, it executes judgments directly from a
+shell/agent, ready to use right after install.
+
 ```text
 Use jev to check whether this ticket is asking for a refund.
 Run jev run feedback over this batch of reviews and flag anything that needs a human.
 ```
 
-## 3. Configure an OpenRouter key
+## 3. Configure a key
+
+The default backend is TypeSafe's own API, keyed by `TYPESAFE_API_KEY`; OpenRouter is also
+supported, keyed by `OPENROUTER_API_KEY`. Keys live only in `~/.config/jev/.env` (mode 600); which
+provider runs is a separate, non-secret setting in `~/.config/jev/config.ini` (mode 644).
+Resolution order: `--provider` -> `JEV_PROVIDER` environment variable -> the pinned default in
+`config.ini` -> auto (TypeSafe if that key exists, else OpenRouter, else an error -- never a silent
+fallback).
 
 Recommended: run `jev auth set` in your own terminal. Input is hidden, and the key never goes
-through chat, a command-line argument, or shell history. No `sk-or-` key yet? Create one at
-[openrouter.ai/keys](https://openrouter.ai/keys) first.
+through chat, a command-line argument, or shell history. No key yet? Create one at
+[console.typesafe.ai/settings/keys](https://console.typesafe.ai/settings/keys) first.
 
 ```bash
 $ jev auth set
-OpenRouter API key（输入不回显）:
+TypeSafe API key（输入不回显，创建于 https://console.typesafe.ai/settings/keys）:
 已保存到 ~/.config/jev/.env（权限 600）。运行 jev auth check 验证。
+当前 provider：TypeSafe（自动）
 
 $ jev auth status
-来源：配置文件 ~/.config/jev/.env
-文件：~/.config/jev/.env
-权限：600
+当前 provider：TypeSafe（自动）
+[TypeSafe]
+  来源：配置文件 ~/.config/jev/.env
+  文件：~/.config/jev/.env
+  权限：600
+[OpenRouter]
+  未配置 OPENROUTER_API_KEY。请在你自己的终端运行 jev auth set --provider openrouter（写入 ~/.config/jev/.env）。
 
 $ jev auth check
-密钥有效
-额度：无上限
-累计用量：0.12 USD
+密钥有效（TypeSafe）
+jev-latest
+jev-preview
 ```
 
-`auth status` only reports source, path and permissions (and suggests `chmod 600` when the mode is
-looser); `auth check` verifies online (read-only, no charge). Neither ever prints the key itself.
+For OpenRouter instead: `jev auth set --provider openrouter` (key from
+[openrouter.ai/keys](https://openrouter.ai/keys), format `sk-or-...`). Both keys can be configured
+at once; `jev provider default openrouter` (or `typesafe`) pins the default so scripts stay
+reproducible -- `auth set` suggests this itself once both keys exist and nothing is pinned. `jev
+provider default auto` clears the pin; `jev provider list` shows both providers' key status at a
+glance. Don't need a provider anymore? `jev auth remove --provider openrouter` deletes its key from
+the config file (a key sourced from an environment variable is untouched, and the command says so).
 
-CI and other non-interactive environments have no terminal; use the environment variable instead:
+`auth status` reports how the active provider was chosen, plus each provider's source, path and
+permissions (and suggests `chmod 600` when the mode is looser); `auth check` verifies the active
+provider's key online (read-only, no charge). Neither ever prints a key itself.
+
+CI and other non-interactive environments have no terminal; use an environment variable, or `jev
+auth set --stdin` to read a key from a password manager (no TTY needed, no confirmation prompts, a
+prefix mismatch errors out without writing anything):
 
 ```sh
-export OPENROUTER_API_KEY=sk-or-...
+export TYPESAFE_API_KEY=...          # default provider
+export OPENROUTER_API_KEY=sk-or-...  # or this one
+# or:
+op read "op://vault/typesafe/key" | jev auth set --stdin
 ```
 
 You can also bypass `auth set` and edit the file yourself:
 
 ```sh
 mkdir -p ~/.config/jev && ${EDITOR:-vi} ~/.config/jev/.env
-# add one line: OPENROUTER_API_KEY=sk-or-...
+# add one line: TYPESAFE_API_KEY=... or OPENROUTER_API_KEY=sk-or-...
 chmod 600 ~/.config/jev/.env
 ```
 
-Lookup order: environment -> `$JEV_ENV_FILE` -> `~/.config/jev/.env` (`XDG_CONFIG_HOME` overrides
-the config dir). There is no `./.env` (current-directory) lookup -- a key belongs to the user, not
-a checkout.
+Lookup order (per provider): environment -> `$JEV_ENV_FILE` -> `~/.config/jev/.env`
+(`XDG_CONFIG_HOME` overrides the config dir). There is no `./.env` (current-directory) lookup -- a
+key belongs to the user, not a checkout.
 
 **Security note:** mode 600 keeps out other OS users; any program running as you -- agents
 included -- can still read any file you can read, and `chmod` does not change that. What `auth
@@ -215,12 +246,15 @@ being dropped. A yes/no question's descriptions go inside `criteria`, with both 
 
 ## 7. Cost and limits
 
-$0.042/M input tokens, output free; about 1 second per call, about $0.00002 (roughly 2 cents per
-1,000 decisions). Keep state plus the longest question under ~32K tokens. `score` allows at most
-10 levels (an API limit). Rate limit is about 1,200 requests/minute; keep `-j`/line-mode
-concurrency at 16 or below. The endpoint is OpenRouter's alpha API; override with `JEV_BASE_URL`
-if it moves. Jev only decides -- it never generates text, so reading, writing or summarizing
-whatever survives the filter is still on you.
+**TypeSafe (default):** $0.042/M input tokens, output free; 64K token context per request, keep
+state plus the longest question under ~32K; rate limit about 1,200 requests/minute. **OpenRouter:**
+the same Jev model, response carries its own `usage.cost`; documented context is 32K; the endpoint
+is OpenRouter's alpha API `https://openrouter.ai/api/alpha/decisions` and may change -- override
+with `JEV_BASE_URL` if it does. Latency: TypeSafe documents 70-500ms; measured from mainland China
+it was about 1 second on both backends, and concurrent calls did not add up linearly. Common to
+both: `score` allows at most 10 levels (an API limit); keep `-j`/line-mode concurrency at 16 or
+below. Jev only decides -- it never generates text, so reading, writing or summarizing whatever
+survives the filter is still on you.
 
 ## 8. Development and verification
 

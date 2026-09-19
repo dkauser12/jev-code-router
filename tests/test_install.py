@@ -190,6 +190,46 @@ class PackageAndInstallTests(unittest.TestCase):
         self.assertIn("symlink", proc.stderr)
         self.assertEqual(list(target.iterdir()), [])
 
+    def test_next_step_hint_shown_when_no_key_anywhere(self):
+        env = self._install_env(self.dist_dir)
+        proc = subprocess.run(["sh", str(INSTALL_SH)], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Next step", proc.stdout)
+        self.assertIn("auth set", proc.stdout)
+        self.assertIn("auth set --provider openrouter", proc.stdout)
+
+    def test_next_step_hint_hidden_when_typesafe_env_var_set(self):
+        env = self._install_env(self.dist_dir)
+        env["TYPESAFE_API_KEY"] = "ts-test"
+        proc = subprocess.run(["sh", str(INSTALL_SH)], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("Next step", proc.stdout)
+
+    def test_next_step_hint_hidden_when_openrouter_env_var_set(self):
+        env = self._install_env(self.dist_dir)
+        env["OPENROUTER_API_KEY"] = "sk-or-test"
+        proc = subprocess.run(["sh", str(INSTALL_SH)], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("Next step", proc.stdout)
+
+    def test_next_step_hint_hidden_when_config_env_file_holds_typesafe_key(self):
+        env = self._install_env(self.dist_dir)
+        cfg_dir = self.home / ".config" / "jev"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / ".env").write_text("TYPESAFE_API_KEY=ts-test\n", encoding="utf-8")
+        proc = subprocess.run(["sh", str(INSTALL_SH)], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("Next step", proc.stdout)
+
+    def test_next_step_hint_hidden_when_config_env_file_holds_openrouter_key(self):
+        env = self._install_env(self.dist_dir)
+        cfg_dir = self.home / ".config" / "jev"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / ".env").write_text("OPENROUTER_API_KEY=sk-or-test\n", encoding="utf-8")
+        proc = subprocess.run(["sh", str(INSTALL_SH)], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("Next step", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

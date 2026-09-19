@@ -135,12 +135,18 @@ main() {
       ;;
   esac
 
-  if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+  if [ -z "${TYPESAFE_API_KEY:-}" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
     cfg_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/jev
-    if [ ! -f "$cfg_dir/.env" ]; then
-      printf '\nNext step: run "%s/jev" auth set in your own terminal to store an OpenRouter key\n' "$bin"
-      printf '(hidden input, never echoed; create a key first at https://openrouter.ai/keys).\n'
-      printf 'CI and other non-interactive environments can set OPENROUTER_API_KEY instead.\n'
+    has_key=0
+    if [ -f "$cfg_dir/.env" ] \
+       && grep -Eq '^(export[ 	]+)?(TYPESAFE_API_KEY|OPENROUTER_API_KEY)=' "$cfg_dir/.env" 2>/dev/null; then
+      has_key=1
+    fi
+    if [ "$has_key" -eq 0 ]; then
+      printf '\nNext step: run "%s/jev" auth set in your own terminal to store a TypeSafe key (default)\n' "$bin"
+      printf '(hidden input, never echoed; create a key first at https://console.typesafe.ai/settings/keys).\n'
+      printf 'Or run "%s/jev" auth set --provider openrouter to use an OpenRouter key instead.\n' "$bin"
+      printf 'CI and other non-interactive environments can set TYPESAFE_API_KEY or OPENROUTER_API_KEY instead.\n'
     fi
   fi
 }

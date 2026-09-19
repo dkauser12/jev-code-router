@@ -1,4 +1,5 @@
-# jev auth set/status/check.
+# jev auth set/status/check, across both providers (TypeSafe is the default
+# provider for `auth set`; OpenRouter is selected with --provider openrouter).
 #
 # `auth set` refuses without a real TTY (an agent has none, by design), so it
 # is exercised two ways: piped stdin (must refuse, exit 2, touch nothing) and
@@ -14,7 +15,7 @@ import time
 import unittest
 
 from base import JevTestCase, JEV_CLI
-from mock_server import DEFAULT_KEY_INFO, MockDecisionsServer
+from mock_server import DEFAULT_KEY_INFO, DEFAULT_NATIVE_MODELS, MockDecisionsServer
 
 try:
     import pty
@@ -84,7 +85,10 @@ def run_cli_in_pty(args, env, interactions, timeout=15):
     return exit_code, buf.decode("utf-8", "replace")
 
 
-class AuthCheckTests(JevTestCase):
+class AuthCheckOpenRouterTests(JevTestCase):
+    """Only OPENROUTER_API_KEY is set by base_env(), so auto-resolution picks
+    openrouter here without needing --provider."""
+
     def test_check_ok_reports_limit_and_usage_without_secrets(self):
         with MockDecisionsServer(key_info={
             **DEFAULT_KEY_INFO, "limit": 20, "limit_remaining": 17.5, "usage": 2.5,
@@ -113,7 +117,7 @@ class AuthCheckTests(JevTestCase):
             self.assertEqual(proc.returncode, 2)
             self.assertIn("密钥无效", proc.stderr)
             self.assertIn("HTTP 401", proc.stderr)
-            self.assertIn("jev auth set", proc.stderr)
+            self.assertIn("jev auth set --provider openrouter", proc.stderr)
 
     def test_check_missing_key_never_hits_the_network(self):
         with MockDecisionsServer() as mock:
@@ -128,6 +132,53 @@ class AuthCheckTests(JevTestCase):
         with MockDecisionsServer() as mock:
             secret = "test"  # the value base_env() sends as OPENROUTER_API_KEY
             env = self.base_env(api_key=secret, JEV_KEY_URL=mock.key_url)
+            proc = self.run_jev(["auth", "check"], env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn(f"Bearer {secret}", proc.stdout + proc.stderr)
+
+
+class AuthCheckNativeTests(JevTestCase):
+    def test_check_ok_lists_model_names(self):
+        with MockDecisionsServer() as mock:
+            env = self.base_env(api_key=None, TYPESAFE_API_KEY="ts-test", JEV_KEY_URL=mock.native_key_url)
+            env.pop("OPENROUTER_API_KEY", None)
+            proc = self.run_jev(["auth", "check"], env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("密钥有效（TypeSafe）", proc.stdout)
+            for name in DEFAULT_NATIVE_MODELS:
+                self.assertIn(name, proc.stdout)
+
+    def test_check_401_bad_key_hints_auth_set(self):
+        with MockDecisionsServer(expected_native_key="right-native-key") as mock:
+            env = self.base_env(api_key=None, TYPESAFE_API_KEY="wrong-key", JEV_KEY_URL=mock.native_key_url)
+            env.pop("OPENROUTER_API_KEY", None)
+            proc = self.run_jev(["auth", "check"], env=env)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("密钥无效", proc.stderr)
+            self.assertIn("HTTP 401", proc.stderr)
+            self.assertIn("jev auth set", proc.stderr)
+
+    def test_check_explicit_provider_flag(self):
+        with MockDecisionsServer() as mock:
+            env = self.base_env(TYPESAFE_API_KEY="ts-test", JEV_KEY_URL=mock.native_key_url)
+            proc = self.run_jev(["auth", "check", "--provider", "typesafe"], env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("密钥有效（TypeSafe）", proc.stdout)
+
+    def test_check_missing_key_never_hits_the_network(self):
+        with MockDecisionsServer() as mock:
+            env = self.base_env(api_key=None, JEV_KEY_URL=mock.native_key_url)
+            env.pop("OPENROUTER_API_KEY", None)
+            proc = self.run_jev(["auth", "check", "--provider", "typesafe"], env=env)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("TYPESAFE_API_KEY", proc.stderr)
+            self.assertEqual([r for r in mock.requests if r.get("method") == "GET"], [])
+
+    def test_check_never_prints_the_key_itself(self):
+        with MockDecisionsServer() as mock:
+            secret = "ts-test"
+            env = self.base_env(api_key=None, TYPESAFE_API_KEY=secret, JEV_KEY_URL=mock.native_key_url)
+            env.pop("OPENROUTER_API_KEY", None)
             proc = self.run_jev(["auth", "check"], env=env)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertNotIn(f"Bearer {secret}", proc.stdout + proc.stderr)
@@ -190,6 +241,38 @@ class AuthStatusTests(JevTestCase):
         self.assertIn("jev auth set", proc.stdout)
 
 
+class AuthStatusMultiProviderTests(JevTestCase):
+    def test_active_provider_line_reflects_auto_choice_of_typesafe(self):
+        env = self.base_env(api_key=None, TYPESAFE_API_KEY="ts-test")
+        env.pop("OPENROUTER_API_KEY", None)
+        proc = self.run_jev(["auth", "status"], env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("当前 provider：TypeSafe（自动）", proc.stdout)
+        self.assertIn("[TypeSafe]", proc.stdout)
+        self.assertIn("[OpenRouter]", proc.stdout)
+        self.assertIn("未配置 OPENROUTER_API_KEY", proc.stdout)
+
+    def test_both_keys_configured_shows_neither_as_unconfigured(self):
+        env = self.base_env(api_key="or-test-key", TYPESAFE_API_KEY="ts-test")
+        proc = self.run_jev(["auth", "status"], env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("当前 provider：TypeSafe", proc.stdout)
+        self.assertNotIn("未配置 TYPESAFE_API_KEY", proc.stdout)
+        self.assertNotIn("未配置 OPENROUTER_API_KEY", proc.stdout)
+
+    def test_explicit_provider_flag_can_be_unconfigured_and_still_reported_as_active(self):
+        env = self.base_env(api_key="or-test-key")  # no TYPESAFE_API_KEY
+        proc = self.run_jev(["auth", "status", "--provider", "typesafe"], env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("当前 provider：TypeSafe（--provider）", proc.stdout)
+
+    def test_jev_provider_env_is_reflected_in_the_reason(self):
+        env = self.base_env(api_key="or-test-key", TYPESAFE_API_KEY="ts-test", JEV_PROVIDER="openrouter")
+        proc = self.run_jev(["auth", "status"], env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("当前 provider：OpenRouter（JEV_PROVIDER）", proc.stdout)
+
+
 class AuthSetNonInteractiveTests(JevTestCase):
     def test_refuses_without_a_tty_and_touches_nothing(self):
         env = self.base_env(api_key=None)
@@ -197,6 +280,17 @@ class AuthSetNonInteractiveTests(JevTestCase):
         proc = self.run_jev(["auth", "set"], input="sk-or-v1-should-not-be-used\n", env=env)
         self.assertEqual(proc.returncode, 2)
         self.assertIn("需要在你自己的终端", proc.stderr)
+        self.assertIn("TYPESAFE_API_KEY", proc.stderr)
+        self.assertFalse((self.xdg_config / "jev" / ".env").exists())
+
+    def test_refuses_without_a_tty_for_openrouter_too(self):
+        env = self.base_env(api_key=None)
+        env.pop("OPENROUTER_API_KEY", None)
+        proc = self.run_jev(
+            ["auth", "set", "--provider", "openrouter"], input="sk-or-v1-should-not-be-used\n", env=env
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("OPENROUTER_API_KEY", proc.stderr)
         self.assertFalse((self.xdg_config / "jev" / ".env").exists())
 
 
@@ -208,17 +302,47 @@ class AuthSetPtyTests(JevTestCase):
         env.pop("JEV_ENV_FILE", None)
         return env
 
-    def test_valid_key_is_saved_and_never_echoed(self):
-        secret = "sk-or-v1-test-fixture-key-abc123"  # hyphenated: never matches a real-key-shaped grep
+    def test_default_provider_is_typesafe(self):
+        secret = "ts-test-fixture-key-abc123"  # hyphenated: never matches a real-key-shaped grep
         code, output = run_cli_in_pty(
             ["auth", "set"], self._env(),
-            [("OpenRouter API key", secret + "\n")],
+            [("TypeSafe API key", secret + "\n")],
         )
         self.assertEqual(code, 0, output)
         self.assertNotIn(secret, output)
         env_path = self.xdg_config / "jev" / ".env"
         self.assertTrue(env_path.is_file())
         self.assertEqual(oct(env_path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(env_path.read_text(encoding="utf-8"), f"TYPESAFE_API_KEY={secret}\n")
+
+    def test_default_preserves_existing_openrouter_key_and_leaves_config_ini_alone(self):
+        cfg = self.xdg_config / "jev"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / ".env").write_text("OPENROUTER_API_KEY=sk-or-v1-existing\n", encoding="utf-8")
+        (cfg / "config.ini").write_text("[jev]\nprovider = openrouter\n", encoding="utf-8")
+        secret = "ts-new-key-value"
+        code, output = run_cli_in_pty(
+            ["auth", "set"], self._env(),
+            [("TypeSafe API key", secret + "\n")],
+        )
+        self.assertEqual(code, 0, output)
+        content = (cfg / ".env").read_text(encoding="utf-8")
+        self.assertIn("OPENROUTER_API_KEY=sk-or-v1-existing", content)
+        self.assertIn(f"TYPESAFE_API_KEY={secret}", content)
+        # config.ini is a separate (non-secret) file; auth set never touches it.
+        self.assertEqual(
+            (cfg / "config.ini").read_text(encoding="utf-8"), "[jev]\nprovider = openrouter\n"
+        )
+
+    def test_provider_openrouter_writes_openrouter_key(self):
+        secret = "sk-or-v1-test-fixture-key-abc123"
+        code, output = run_cli_in_pty(
+            ["auth", "set", "--provider", "openrouter"], self._env(),
+            [("OpenRouter API key", secret + "\n")],
+        )
+        self.assertEqual(code, 0, output)
+        self.assertNotIn(secret, output)
+        env_path = self.xdg_config / "jev" / ".env"
         self.assertEqual(env_path.read_text(encoding="utf-8"), f"OPENROUTER_API_KEY={secret}\n")
 
     def test_other_lines_preserved_and_symlink_target_updated(self):
@@ -226,7 +350,7 @@ class AuthSetPtyTests(JevTestCase):
         real_dir.mkdir()
         real_path = real_dir / "actual.env"
         real_path.write_text(
-            "# a comment\nOTHER_VAR=keep-me\nexport OPENROUTER_API_KEY=old-value\nKEEP=also\n",
+            "# a comment\nOTHER_VAR=keep-me\nexport TYPESAFE_API_KEY=old-value\nKEEP=also\n",
             encoding="utf-8",
         )
         os.chmod(real_path, 0o644)
@@ -235,10 +359,10 @@ class AuthSetPtyTests(JevTestCase):
         link_path = cfg / ".env"
         link_path.symlink_to(real_path)
 
-        secret = "sk-or-v1-newvalue"
+        secret = "ts-newvalue"
         code, output = run_cli_in_pty(
             ["auth", "set"], self._env(),
-            [("OpenRouter API key", secret + "\n")],
+            [("TypeSafe API key", secret + "\n")],
         )
         self.assertEqual(code, 0, output)
         self.assertNotIn(secret, output)
@@ -249,24 +373,45 @@ class AuthSetPtyTests(JevTestCase):
         self.assertIn("OTHER_VAR=keep-me", content)
         self.assertIn("KEEP=also", content)
         self.assertNotIn("old-value", content)
-        self.assertIn(f"OPENROUTER_API_KEY={secret}", content)
+        self.assertIn(f"TYPESAFE_API_KEY={secret}", content)
         self.assertEqual(oct(real_path.stat().st_mode & 0o777), "0o600")
 
-    def test_non_sk_or_prefix_declined_leaves_no_file(self):
-        secret = "not-a-real-key"
+    def test_sk_or_value_for_typesafe_triggers_confirm_and_no_leaves_no_file(self):
+        secret = "sk-or-v1-looks-like-openrouter"
         code, output = run_cli_in_pty(
             ["auth", "set"], self._env(),
+            [("TypeSafe API key", secret + "\n"), ("y/N", "n\n")],
+        )
+        self.assertEqual(code, 2, output)
+        self.assertIn("这看起来是 OpenRouter 的密钥", output)
+        self.assertNotIn(secret, output)  # getpass never echoes, accepted or not
+        self.assertFalse((self.xdg_config / "jev" / ".env").exists())
+
+    def test_sk_or_value_for_typesafe_accepted_on_yes(self):
+        secret = "sk-or-v1-user-insists-typesafe"
+        code, output = run_cli_in_pty(
+            ["auth", "set"], self._env(),
+            [("TypeSafe API key", secret + "\n"), ("y/N", "y\n")],
+        )
+        self.assertEqual(code, 0, output)
+        env_path = self.xdg_config / "jev" / ".env"
+        self.assertEqual(env_path.read_text(encoding="utf-8"), f"TYPESAFE_API_KEY={secret}\n")
+
+    def test_openrouter_non_sk_or_prefix_declined_leaves_no_file(self):
+        secret = "not-a-real-key"
+        code, output = run_cli_in_pty(
+            ["auth", "set", "--provider", "openrouter"], self._env(),
             [("OpenRouter API key", secret + "\n"), ("y/N", "n\n")],
         )
         self.assertEqual(code, 2, output)
         self.assertIn("不像是 OpenRouter 密钥", output)
-        self.assertNotIn(secret, output)  # getpass never echoes, accepted or not
+        self.assertNotIn(secret, output)
         self.assertFalse((self.xdg_config / "jev" / ".env").exists())
 
-    def test_non_sk_or_prefix_accepted_on_yes(self):
+    def test_openrouter_non_sk_or_prefix_accepted_on_yes(self):
         secret = "not-a-real-key-but-user-insists"
         code, output = run_cli_in_pty(
-            ["auth", "set"], self._env(),
+            ["auth", "set", "--provider", "openrouter"], self._env(),
             [("OpenRouter API key", secret + "\n"), ("y/N", "y\n")],
         )
         self.assertEqual(code, 0, output)

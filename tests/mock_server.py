@@ -1,14 +1,23 @@
-# Local mock of OpenRouter's POST /api/alpha/decisions and GET /api/v1/key,
-# for offline jev tests.
+# Local mock of both provider backends, for offline jev tests:
+#   - OpenRouter-shaped: POST /api/alpha/decisions, GET /api/v1/key
+#   - TypeSafe native-shaped: POST /v1/systemone, GET /v1/models
+# Both run on the same server instance/port so a single mock can exercise
+# provider-switching behavior; each has its own expected bearer token.
 #
 # Not a test module itself (no Test* classes) -- imported by tests/test_*.py.
 # Validates request shape the way the real API is documented to (model/state/
 # questions present and typed, per-type criteria rules), then returns a
 # deterministic canned answer so tests can assert exact output.
 #
-# GET /api/v1/key (used by `jev auth check`): `Bearer <expected_key>` -> 200
-# with a canned key-info body (including a fake `label` and `creator_user_id`
-# so tests can confirm the CLI never prints either); any other bearer -> 401.
+# GET /api/v1/key (used by `jev auth check` for openrouter): `Bearer
+# <expected_key>` -> 200 with a canned key-info body (including a fake
+# `label` and `creator_user_id` so tests can confirm the CLI never prints
+# either); any other bearer -> 401.
+#
+# GET /v1/models (used by `jev auth check` for typesafe): `Bearer
+# <expected_native_key>` -> 200 with {"data": [...model names...]}; missing
+# Authorization -> 403; wrong bearer -> 401 -- both with the exact `detail`
+# bodies TypeSafe's live API returns (see docstrings below).
 #
 # Canned-answer convention, read from the `state` when it is a plain string:
 #   noul question   -- "YES" in text -> 0.9, "NO" in text -> 0.1, else 0.5
@@ -16,14 +25,26 @@
 #   score question  -- "SCORE=<index>" selects that 0-based level (else the middle)
 # Special exact/prefix triggers (again matched against a string `state`) return
 # specific error shapes or timing behavior instead of a canned answer:
-#   "TRIGGER_ZOD_ERROR"     -- 400, error.message is a JSON-encoded Zod issue array
-#   "TRIGGER_HTTP400_STR"   -- 400, error.message == 'HTTP 400: {"detail": "..."}'
-#   "TRIGGER_HTTP400_OBJ"   -- 400, same shape, detail is an object with "message"
-#   "TRIGGER_PLAIN_ERROR"   -- 400, error.message is a plain string
-#   "RETRY429:<anything>"   -- 429 + Retry-After: 0 on the first call for that
-#                              exact state, 200 with a canned answer after
-#   "SLOW:<ms>:<anything>"  -- sleeps ms milliseconds before a canned answer
-# A wrong bearer token always short-circuits to 401, before any of the above.
+#   "TRIGGER_ZOD_ERROR"          -- 400, error.message is a JSON-encoded Zod issue array
+#   "TRIGGER_HTTP400_STR"        -- 400, error.message == 'HTTP 400: {"detail": "..."}'
+#   "TRIGGER_HTTP400_OBJ"        -- 400, same shape, detail is an object with "message"
+#   "TRIGGER_PLAIN_ERROR"        -- 400, error.message is a plain string
+#   "TRIGGER_NATIVE_422_LIST"    -- native only: 422, missing-field issue list (verified live shape)
+#   "TRIGGER_NATIVE_422_DICT"    -- native only: 422, detail is an object with "message"
+#   "TRIGGER_NATIVE_UNKNOWN_TYPE"  -- native only: 400, unknown question type (verified live shape)
+#   "TRIGGER_NATIVE_UNKNOWN_MODEL" -- native only: 400, unknown model, echoes the request's model
+#   "TRIGGER_NATIVE_TOO_MANY_LEVELS" -- native only: 400, detail is a plain string (verified live shape)
+#   "RETRY429:<anything>"        -- 429 + Retry-After: 0 on the first call for that
+#                                   exact state, 200 with a canned answer after
+#   "SLOW:<ms>:<anything>"       -- sleeps ms milliseconds before a canned answer
+# A wrong bearer token always short-circuits to 401 (or 403 if missing
+# entirely, native only), before any of the above.
+#
+# One verified behavior difference between backends: the native route accepts
+# a one-sided `noul` criteria object (200); the OpenRouter route keeps
+# rejecting it (400) like before -- jev's own client-side validation already
+# requires both sides for every typed verb and spec, so this only matters to
+# `jev raw`, which sends a body verbatim.
 from __future__ import annotations
 
 import json
@@ -45,14 +66,68 @@ DEFAULT_KEY_INFO = {
     "creator_user_id": "user_fake00000000000000000",
 }
 
+# GET /v1/models returned exactly these two, live, against a real account.
+DEFAULT_NATIVE_MODELS = ["jev-latest", "jev-preview"]
+
+
+def _native_missing_auth_body():
+    # Exact shape observed live: no Authorization header -> HTTP 403.
+    return {"detail": {
+        "error_type": "authentication_error",
+        "message": "Must supply an API key! Check your request and try again.",
+    }}
+
+
+def _native_bad_key_body():
+    # Exact shape observed live: wrong bearer -> HTTP 401 (same for GET /v1/models).
+    return {"detail": {
+        "error_type": "authentication_error",
+        "message": "Cannot authenticate with the server. Please check your API key and try again.",
+    }}
+
+
+def _native_422_list_body():
+    # Exact shape observed live for a missing required field.
+    return {"detail": [
+        {"type": "missing", "loc": ["body", "questions", "q", "choice", "criteria"],
+         "msg": "Field required", "input": {}}
+    ]}
+
+
+def _native_422_dict_body():
+    return {"detail": {"message": "Invalid criteria shape"}}
+
+
+def _native_unknown_question_type_body():
+    # Exact shape observed live for an unrecognized question "type".
+    return {"detail": {"error_type": "api_usage_error", "message": "Invalid request."}}
+
+
+def _native_unknown_model_body(model_name):
+    # Exact shape observed live for a model name the account can't use.
+    return {"detail": {"error_type": "api_usage_error", "message": f"Unknown model: {model_name}"}}
+
+
+def _native_too_many_score_levels_body():
+    # Exact shape observed live: a plain string, not an object, at 400.
+    return {"detail": "Too many score levels. Must have at most 10 levels."}
+
 
 class MockDecisionsServer:
     def __init__(self, expected_key="test", path="/api/alpha/decisions",
-                 key_path="/api/v1/key", key_info=None):
+                 key_path="/api/v1/key", key_info=None,
+                 expected_native_key="ts-test",
+                 native_decisions_path="/v1/systemone",
+                 native_models_path="/v1/models",
+                 native_models=None):
         self.expected_key = expected_key
         self.path = path
         self.key_path = key_path
         self.key_info = dict(DEFAULT_KEY_INFO if key_info is None else key_info)
+        self.expected_native_key = expected_native_key
+        self.native_decisions_path = native_decisions_path
+        self.native_models_path = native_models_path
+        self.native_models = list(DEFAULT_NATIVE_MODELS if native_models is None else native_models)
         self._lock = threading.Lock()
         self._requests = []
         self._retry_seen = set()
@@ -82,6 +157,14 @@ class MockDecisionsServer:
     @property
     def key_url(self):
         return f"http://127.0.0.1:{self.port}{self.key_path}"
+
+    @property
+    def native_base_url(self):
+        return f"http://127.0.0.1:{self.port}{self.native_decisions_path}"
+
+    @property
+    def native_key_url(self):
+        return f"http://127.0.0.1:{self.port}{self.native_models_path}"
 
     def log(self, entry):
         with self._lock:
@@ -144,6 +227,37 @@ def _validate_questions(questions):
                     return 400, _zod_error_body(
                         [(["questions", name, "criteria", "false"], "Required")]
                     )
+    return None
+
+
+def _validate_questions_native(questions):
+    """Same request-shape checks as _validate_questions, but in the native
+    error shapes, and -- verified live -- accepting a one-sided `noul`
+    criteria object where OpenRouter rejects it. jev's own client-side
+    validation already requires both sides for every typed verb and spec, so
+    this only matters to `jev raw`."""
+    if not isinstance(questions, dict) or not questions:
+        return 422, _native_422_list_body()
+    for name, q in questions.items():
+        if not isinstance(q, dict):
+            return 422, _native_422_list_body()
+        qtype = q.get("type")
+        if qtype not in ("noul", "choice", "score"):
+            return 400, _native_unknown_question_type_body()
+        if not q.get("instructions"):
+            return 422, _native_422_list_body()
+        criteria = q.get("criteria")
+        if qtype == "choice":
+            if not isinstance(criteria, dict) or len(criteria) < 2:
+                return 422, _native_422_list_body()
+        elif qtype == "score":
+            if not isinstance(criteria, list):
+                return 422, _native_422_list_body()
+            if len(criteria) > 10:
+                return 400, _native_too_many_score_levels_body()
+            if len(criteria) < 2:
+                return 422, _native_422_list_body()
+        # noul: no shape restriction on criteria here -- one-sided is accepted live.
     return None
 
 
@@ -215,6 +329,17 @@ def _make_handler(server):
                 "headers": {k.lower(): v for k, v in self.headers.items()},
                 "body": None,
             })
+
+            if self.path == server.native_models_path:
+                if not auth:
+                    self._send_json(403, _native_missing_auth_body())
+                    return
+                if auth != f"Bearer {server.expected_native_key}":
+                    self._send_json(401, _native_bad_key_body())
+                    return
+                self._send_json(200, {"data": list(server.native_models)})
+                return
+
             if self.path != server.key_path:
                 self._send_json(404, _plain_error_body("Not found"))
                 return
@@ -222,6 +347,64 @@ def _make_handler(server):
                 self._send_json(401, _plain_error_body("User not found."))
                 return
             self._send_json(200, {"data": server.key_info})
+
+        def _do_post_native(self, body, auth):
+            if not auth:
+                self._send_json(403, _native_missing_auth_body())
+                return
+            if auth != f"Bearer {server.expected_native_key}":
+                self._send_json(401, _native_bad_key_body())
+                return
+            if not isinstance(body, dict) or not body.get("model") or \
+                    "state" not in body or body["state"] in (None, ""):
+                self._send_json(422, _native_422_dict_body())
+                return
+
+            state = body["state"]
+            if isinstance(state, str):
+                if state == "TRIGGER_NATIVE_422_LIST":
+                    self._send_json(422, _native_422_list_body())
+                    return
+                if state == "TRIGGER_NATIVE_422_DICT":
+                    self._send_json(422, _native_422_dict_body())
+                    return
+                if state == "TRIGGER_NATIVE_UNKNOWN_TYPE":
+                    self._send_json(400, _native_unknown_question_type_body())
+                    return
+                if state == "TRIGGER_NATIVE_UNKNOWN_MODEL":
+                    self._send_json(400, _native_unknown_model_body(body.get("model", "")))
+                    return
+                if state == "TRIGGER_NATIVE_TOO_MANY_LEVELS":
+                    self._send_json(400, _native_too_many_score_levels_body())
+                    return
+                if state.startswith("RETRY429:"):
+                    if not server.retry_seen_before("native:" + state):
+                        self._send_json(429, _plain_error_body("Rate limited"),
+                                         extra_headers={"Retry-After": "0"})
+                        return
+                if state.startswith("SLOW:"):
+                    try:
+                        ms = int(state.split(":", 2)[1])
+                    except (IndexError, ValueError):
+                        ms = 0
+                    time.sleep(ms / 1000.0)
+
+            err = _validate_questions_native(body.get("questions"))
+            if err is not None:
+                status, err_body = err
+                self._send_json(status, err_body)
+                return
+
+            answers = {
+                name: _canned_answer(q, state)
+                for name, q in body["questions"].items()
+            }
+            # Native response: no id, no usage.cost, no provider field.
+            self._send_json(200, {
+                "model": body["model"],
+                "answers": answers,
+                "usage": {"input_tokens": 50, "output_tokens": 5},
+            })
 
         def do_POST(self):  # noqa: N802 - stdlib method name
             length = int(self.headers.get("Content-Length") or 0)
@@ -242,6 +425,10 @@ def _make_handler(server):
                 "headers": {k.lower(): v for k, v in self.headers.items()},
                 "body": body,
             })
+
+            if self.path == server.native_decisions_path:
+                self._do_post_native(body, auth)
+                return
 
             if auth != f"Bearer {server.expected_key}":
                 self._send_json(401, _plain_error_body("No auth credentials found"))

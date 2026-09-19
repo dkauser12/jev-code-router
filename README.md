@@ -4,12 +4,12 @@
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue)](jev/scripts/jev)
 
-**命令行里的类型化判断：`yes`/`pick`/`score`，每个答案都带校准概率 —— TypeSafe Jev 通过 OpenRouter 调用，CLI + Agent Skill。**
+**命令行里的类型化判断：`yes`/`pick`/`score`，每个答案都带校准概率 —— 默认走 TypeSafe 官方 API，也支持 OpenRouter，CLI + Agent Skill。**
 
 中文 · [English](README.en.md)
 
-`jev` 是非官方的社区封装，只支持 OpenRouter 这一个后端；不隶属于 TypeSafe 或 OpenRouter。单文件、仅
-标准库、Python 3.9+，一次调用约 1 秒、约 $0.00002。
+`jev` 是非官方的社区封装，支持 TypeSafe 官方 API（默认）和 OpenRouter 两个后端；不隶属于 TypeSafe
+或 OpenRouter。单文件、仅标准库、Python 3.9+。
 
 作者：**okooo5km(十里)**。更多技能：[sink.5km.tech/skills](https://sink.5km.tech/skills)。
 
@@ -76,51 +76,76 @@ npx skills add okooo5km/jev -g
 Agent。技能内置了 CLI（`scripts/jev`），首次使用时 Agent 按技能说明把它链接到 `~/.local/bin`。更新
 `npx skills update jev -g`，卸载 `npx skills remove jev -g`。
 
+TypeSafe 官方也有一个 Agent Skill（`npx skills add typesafe-ai/skills --skill typesafe-ai`），教你
+在自己的程序里把 TypeSafe 写成编程原语——那是"设计和集成"。`jev` 是另一件事：不用写代码，直接从
+shell/agent 里跑判断，装完就能用。
+
 ```text
 用 jev 判断这条工单是不是要求退款。
 把这批评论跑一遍 jev run feedback，标出需要人工处理的。
 ```
 
-## 3. 配置 OpenRouter 密钥
+## 3. 配置密钥
+
+默认后端是 TypeSafe 官方 API，密钥是 `TYPESAFE_API_KEY`；也支持 OpenRouter，密钥是
+`OPENROUTER_API_KEY`。密钥只存在 `~/.config/jev/.env`（权限 600）；用哪个 provider 是单独的非密钥
+设置，存在 `~/.config/jev/config.ini`（权限 644）。解析顺序：`--provider` → `JEV_PROVIDER` 环境变量
+→ `config.ini` 里固定的默认值 → 自动（有 TypeSafe 密钥用 TypeSafe，否则有 OpenRouter 密钥用
+OpenRouter，都没有就报错，不会静默切换）。
 
 推荐做法：在你自己的终端运行 `jev auth set`。输入不回显，密钥不经过聊天、命令行参数和 shell
-历史。没有 sk-or- 开头的密钥，先在 [openrouter.ai/keys](https://openrouter.ai/keys) 创建一个。
+历史。没有密钥先在 [console.typesafe.ai/settings/keys](https://console.typesafe.ai/settings/keys)
+创建一个。
 
 ```bash
 $ jev auth set
-OpenRouter API key（输入不回显）: 
+TypeSafe API key（输入不回显，创建于 https://console.typesafe.ai/settings/keys）: 
 已保存到 ~/.config/jev/.env（权限 600）。运行 jev auth check 验证。
+当前 provider：TypeSafe（自动）
 
 $ jev auth status
-来源：配置文件 ~/.config/jev/.env
-文件：~/.config/jev/.env
-权限：600
+当前 provider：TypeSafe（自动）
+[TypeSafe]
+  来源：配置文件 ~/.config/jev/.env
+  文件：~/.config/jev/.env
+  权限：600
+[OpenRouter]
+  未配置 OPENROUTER_API_KEY。请在你自己的终端运行 jev auth set --provider openrouter（写入 ~/.config/jev/.env）。
 
 $ jev auth check
-密钥有效
-额度：无上限
-累计用量：0.12 USD
+密钥有效（TypeSafe）
+jev-latest
+jev-preview
 ```
 
-`auth status` 只报告来源、路径和权限（不是 600 时提示 `chmod 600`），`auth check` 联网校验（只读、不计费），
-两者都不打印密钥本身。
+要用 OpenRouter：`jev auth set --provider openrouter`（密钥在
+[openrouter.ai/keys](https://openrouter.ai/keys) 创建，格式 `sk-or-...`）。两个密钥可以同时配置；
+`jev provider default openrouter`（或 `typesafe`）把默认 provider 固定下来，脚本行为才可复现——两
+个密钥都配置又没固定默认时，`auth set` 会提示这一点。`jev provider default auto` 清除固定，恢复自
+动检测；`jev provider list` 一眼看两边密钥状态。不再需要某个 provider 时，`jev auth remove
+--provider openrouter` 从配置文件里删掉它的密钥（来自环境变量的密钥不受影响，命令会说明）。
 
-CI 等非交互环境没有终端，用环境变量：
+CI 等非交互环境没有终端，用环境变量，或用 `jev auth set --stdin` 从密码管理器读取（不需要 TTY，不
+会有确认提示，前缀不对直接报错、不写入）：
 
 ```sh
-export OPENROUTER_API_KEY=sk-or-...
+export TYPESAFE_API_KEY=...          # 默认 provider
+export OPENROUTER_API_KEY=sk-or-...  # 或者这个
+# 或者：
+op read "op://vault/typesafe/key" | jev auth set --stdin
 ```
 
 也可以绕开 `auth set`，自己编辑文件：
 
 ```sh
 mkdir -p ~/.config/jev && ${EDITOR:-vi} ~/.config/jev/.env
-# 写入一行：OPENROUTER_API_KEY=sk-or-...
+# 写入一行：TYPESAFE_API_KEY=... 或 OPENROUTER_API_KEY=sk-or-...
 chmod 600 ~/.config/jev/.env
 ```
 
-查找顺序：环境变量 → `$JEV_ENV_FILE` → `~/.config/jev/.env`（`XDG_CONFIG_HOME` 可覆盖配置目录）。
-没有 `./.env`（当前目录）这一项——密钥属于用户，不属于某个仓库。
+查找顺序（每个 provider 独立）：环境变量 → `$JEV_ENV_FILE` → `~/.config/jev/.env`
+（`XDG_CONFIG_HOME` 可覆盖配置目录）。没有 `./.env`（当前目录）这一项——密钥属于用户，不属于某个
+仓库。
 
 **安全说明**：600 权限挡住的是其他系统用户；以你身份运行的任何程序——包括 AI agent——只要能读你能
 读的文件，就能读到这个密钥，`chmod` 挡不住这一层。`auth set` 保证的只是密钥不经过聊天、不经过命令
@@ -206,10 +231,13 @@ false = "可以排期"
 
 ## 7. 费用与限制
 
-输入 $0.042/M token，输出免费；单次调用约 1 秒，约 $0.00002（1000 次约 $0.02）。状态+最长问题建议
-控制在 32K token 以内。`score` 最多 10 个等级（API 硬限制）。速率限制约 1,200 请求/分钟，`-j`/逐行
-并发建议不超过 16。接口是 OpenRouter 的 alpha 端点，如有变化用 `JEV_BASE_URL` 覆盖。Jev 只做决策，
-不生成文本——过滤之后的内容仍需要你自己读、写或总结。
+**TypeSafe 官方（默认）**：输入 $0.042/M token，输出免费；单次请求上下文 64K token，状态+最长问
+题建议控制在 32K 以内；速率限制约 1,200 请求/分钟。**OpenRouter**：同一个 Jev 模型，响应自带
+`usage.cost`；文档给出的上下文是 32K；接口是 alpha 端点
+`https://openrouter.ai/api/alpha/decisions`，如有变化用 `JEV_BASE_URL` 覆盖。延迟：TypeSafe 文档
+给出 70–500ms；作者在国内网络实测两边都约 1 秒，并发调用不是线性叠加。两边通用：`score` 最多 10
+个等级（API 硬限制），`-j`/逐行并发建议不超过 16。Jev 只做决策，不生成文本——过滤之后的内容仍需
+要你自己读、写或总结。
 
 ## 8. 开发与验证
 

@@ -2,7 +2,7 @@
 # jev - TypeSafe Jev 决策模型命令行工具
 #
 # 把模糊判断变成带校准概率的类型化答案，可直接用于 shell 管道和 if 判断。
-# 通过 OpenRouter 的 decisions 接口调用 TypeSafe Jev 模型。
+# 默认通过 TypeSafe 官方 API 调用 Jev 模型，也可切换到 OpenRouter 的 decisions 接口。
 #
 # Author: okooo5km(十里)
 #
@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import getpass
 import json
 import os
@@ -29,6 +30,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
 try:
     import tomllib
@@ -36,10 +38,38 @@ except ImportError:  # Python < 3.11
     tomllib = None
 
 VERSION = "0.2.1"
-BASE_URL_DEFAULT = "https://openrouter.ai/api/alpha/decisions"
-KEY_URL_DEFAULT = "https://openrouter.ai/api/v1/key"
-DEFAULT_MODEL = "~typesafe/jev-latest"
+USER_AGENT = f"jev-cli/{VERSION} (+https://github.com/okooo5km/jev)"
 SIZE_WARN_TOKENS = 30000
+
+# --------------------------------------------------------------------------
+# provider 表：所有 provider 特定的东西都从这里读，多一个网关只需要多一条记录。
+# --------------------------------------------------------------------------
+
+PROVIDERS = {
+    "typesafe": {
+        "label": "TypeSafe",
+        "base_url": "https://api.typesafe.ai/v1/systemone",
+        "key_url": "https://api.typesafe.ai/v1/models",
+        "key_env": "TYPESAFE_API_KEY",
+        "default_model": "jev-latest",
+        "key_page": "https://console.typesafe.ai/settings/keys",
+        "key_prefix": None,
+        "extra_headers": {},
+        "price_per_mtok": 0.042,  # 输出免费，只有输入计费
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/alpha/decisions",
+        "key_url": "https://openrouter.ai/api/v1/key",
+        "key_env": "OPENROUTER_API_KEY",
+        "default_model": "~typesafe/jev-latest",
+        "key_page": "https://openrouter.ai/keys",
+        "key_prefix": "sk-or-",
+        "extra_headers": {"X-Title": "jev-cli", "HTTP-Referer": "https://github.com/okooo5km/jev"},
+        "price_per_mtok": None,  # 响应自带 usage.cost，不需要估算
+    },
+}
+DEFAULT_PROVIDER = "typesafe"
 
 
 # --------------------------------------------------------------------------
@@ -95,7 +125,70 @@ def default_env_path():
     return os.path.join(config_dir(), ".env")
 
 
-def locate_api_key():
+def config_ini_path():
+    """非密钥设置的位置：<config dir>/config.ini（权限 0644，可读）。密钥只存在
+    <config dir>/.env（权限 0600）——两者分开，同 gh 的 hosts.yml/config.yml、
+    aws 的 credentials/config、llm 的 keys.json。"""
+    return os.path.join(config_dir(), "config.ini")
+
+
+def read_pinned_provider():
+    """读取 config.ini 里 [jev] provider 的值；文件不存在/解析失败/未设置都返回 None。"""
+    parser = _load_config_ini()
+    if parser is None or not parser.has_section("jev"):
+        return None
+    val = parser.get("jev", "provider", fallback=None)
+    return val.strip() if val else None
+
+
+def _load_config_ini():
+    """解析 config.ini；文件不存在返回 None。解析失败必须报错而不是当成没有——
+    静默忽略会让固定好的 provider 悄悄失效，写入时还会覆盖掉用户的文件。"""
+    path = config_ini_path()
+    if not os.path.isfile(path):
+        return None
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            parser.read_file(f)
+    except (configparser.Error, OSError, UnicodeDecodeError) as e:
+        raise JevError(f"jev: 无法解析 {path}（{e}）。请修正或删除该文件。", 2)
+    return parser
+
+
+def write_pinned_provider(value):
+    """写入（或 value=None 时清除）config.ini 的 [jev] provider，原子替换，保留其它
+    section/key，权限 0644（不是密钥，不需要 0600）。返回写入的文件路径。"""
+    cfg_dir = config_dir()
+    os.makedirs(cfg_dir, mode=0o700, exist_ok=True)
+    path = config_ini_path()
+    parser = _load_config_ini() or configparser.ConfigParser(interpolation=None)
+    if value is None:
+        if parser.has_section("jev"):
+            parser.remove_option("jev", "provider")
+    else:
+        if not parser.has_section("jev"):
+            parser.add_section("jev")
+        parser.set("jev", "provider", value)
+
+    tmp_path = os.path.join(cfg_dir, f".jev-config-{os.getpid()}-{int(time.time() * 1000)}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            parser.write(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    os.chmod(path, 0o644)
+    return path
+
+
+def locate_api_key(provider):
     """单一查找实现，供决策调用、`auth status`、`auth check` 共用。
 
     返回 (key, source, path)：
@@ -104,7 +197,8 @@ def locate_api_key():
       - 命中配置目录 .env：("<key>", "config", "<file 路径>")
       - 未命中：(None, None, "<配置目录 .env 的路径，供报错/提示使用>")
     """
-    key = os.environ.get("OPENROUTER_API_KEY")
+    key_env = PROVIDERS[provider]["key_env"]
+    key = os.environ.get(key_env)
     if key:
         return key.strip(), "env", None
 
@@ -118,33 +212,142 @@ def locate_api_key():
     for source, path in candidates:
         if path and os.path.isfile(path):
             data = parse_env_file(path)
-            v = data.get("OPENROUTER_API_KEY")
+            v = data.get(key_env)
             if v:
                 return v.strip(), source, path
 
     return None, None, default_env
 
 
-def resolve_api_key():
-    key, _source, _path = locate_api_key()
+def _auth_set_cmd(provider):
+    return "jev auth set" if provider == DEFAULT_PROVIDER else f"jev auth set --provider {provider}"
+
+
+def resolve_api_key(provider):
+    key, _source, _path = locate_api_key(provider)
     if key:
         return key
+    info = PROVIDERS[provider]
     raise JevError(
-        "jev: 未找到 OPENROUTER_API_KEY。请设置环境变量，或在 $JEV_ENV_FILE 指向的文件"
+        f"jev: 未找到 {info['key_env']}。请设置环境变量，或在 $JEV_ENV_FILE 指向的文件"
         f"或 {default_env_path()} 中配置（配置目录可用 XDG_CONFIG_HOME 覆盖）。"
-        "在你自己的终端运行 jev auth set 可以交互式配置，密钥不会经过聊天或命令行参数。",
+        f"在你自己的终端运行 {_auth_set_cmd(provider)} 可以交互式配置，密钥不会经过聊天或命令行参数。",
         2,
     )
 
 
-def resolve_model(model_arg):
-    if model_arg:
-        return model_arg
-    return os.environ.get("JEV_MODEL") or DEFAULT_MODEL
+def resolve_provider_name(explicit=None):
+    """返回 (provider, reason)。reason ∈ {"--provider","JEV_PROVIDER","config.ini","auto"}。
+
+    优先级：--provider → 环境变量 JEV_PROVIDER → config.ini 里 [jev] provider →
+    自动检测（有 TypeSafe key 用 typesafe，否则有 OpenRouter key 用 openrouter，
+    都没有则报错）。显式选择的 provider 即使没有对应 key 也不会在这里报错——
+    缺 key 的报错由 resolve_api_key 给出，会点名具体是哪个 provider。
+
+    注意：JEV_PROVIDER 只认环境变量，不会去 <config dir>/.env 里找同名的一行——
+    .env 只放密钥，非密钥设置一律进 config.ini（`jev provider default` 写它）。"""
+    if explicit:
+        return explicit, "--provider"
+
+    env_val = os.environ.get("JEV_PROVIDER")
+    if env_val:
+        if env_val not in PROVIDERS:
+            raise JevError(
+                f"jev: JEV_PROVIDER 值无效: {env_val}（可选 {'/'.join(PROVIDERS)}）", 2
+            )
+        return env_val, "JEV_PROVIDER"
+
+    pinned = read_pinned_provider()
+    if pinned:
+        if pinned not in PROVIDERS:
+            raise JevError(
+                f"jev: {config_ini_path()} 中的 provider 值无效: {pinned}"
+                f"（可选 {'/'.join(PROVIDERS)}）", 2
+            )
+        return pinned, "config.ini"
+
+    ts_key, _, _ = locate_api_key("typesafe")
+    if ts_key:
+        return "typesafe", "auto"
+    or_key, _, _ = locate_api_key("openrouter")
+    if or_key:
+        return "openrouter", "auto"
+
+    raise JevError(
+        "jev: 未找到任何 API key。请设置 TYPESAFE_API_KEY（默认后端，运行 jev auth set 配置）"
+        "或 OPENROUTER_API_KEY（运行 jev auth set --provider openrouter 配置）。",
+        2,
+    )
 
 
-def resolve_base_url():
-    return os.environ.get("JEV_BASE_URL") or BASE_URL_DEFAULT
+def resolve_auth_provider(explicit):
+    """`auth set` 专用：不做按 key 是否存在的自动检测（本来就是来配置 key 的），
+    默认落到 typesafe。优先级：--provider → JEV_PROVIDER → typesafe。"""
+    if explicit:
+        return explicit
+    env_val = os.environ.get("JEV_PROVIDER")
+    if env_val:
+        if env_val not in PROVIDERS:
+            raise JevError(
+                f"jev: JEV_PROVIDER 值无效: {env_val}（可选 {'/'.join(PROVIDERS)}）", 2
+            )
+        return env_val
+    return DEFAULT_PROVIDER
+
+
+_VERSIONED_SHORT_RE = re.compile(r"^jev-\d+\.\d+$")
+_VERSIONED_LONG_RE = re.compile(r"^jev-(\d+\.\d+)\.0$")
+
+
+def normalize_model(model, provider):
+    """把可移植的别名/版本号换成目标 provider 认识的形式；不认识的字符串原样放行。
+
+    实测确认：原生 API 只接受 jev-latest / jev-preview / jev-1.13.0 这类三段式版本号
+    （jev-1.13 会被拒为 Unknown model）；OpenRouter 的版本化 ID 是 typesafe/jev-1.13
+    （两段式，无 patch）。jev-latest 两边都有；jev-preview 只有原生 API 有（实测
+    OpenRouter 返回 Model ~typesafe/jev-preview does not exist，照常透传让它明确
+    报错，不悄悄换成 latest）。版本号形式不通用，这里按已知的
+    `jev-X.Y` <-> `jev-X.Y.0` 规律做映射；其它写法原样放行，报错时提示
+    `jev auth check` 查看账号可用的模型名。"""
+    if provider == "typesafe":
+        m = model
+        if m.startswith("~"):
+            m = m[1:]
+        if m.startswith("typesafe/"):
+            m = m[len("typesafe/"):]
+        if _VERSIONED_SHORT_RE.match(m):
+            m = f"{m}.0"
+        return m
+    # openrouter
+    if "/" in model:
+        return model
+    if model in ("jev-latest", "jev-preview"):
+        return f"~typesafe/{model}"
+    m = _VERSIONED_LONG_RE.match(model)
+    if m:
+        return f"typesafe/jev-{m.group(1)}"
+    return f"typesafe/{model}"
+
+
+def resolve_model(model_arg, provider, spec_model=None):
+    raw = model_arg or spec_model or os.environ.get("JEV_MODEL") or PROVIDERS[provider]["default_model"]
+    return normalize_model(raw, provider)
+
+
+def resolve_base_url(provider):
+    return os.environ.get("JEV_BASE_URL") or PROVIDERS[provider]["base_url"]
+
+
+def resolve_key_url(provider):
+    return os.environ.get("JEV_KEY_URL") or PROVIDERS[provider]["key_url"]
+
+
+def provider_headers(provider, api_key, content_type=False):
+    headers = {"Authorization": f"Bearer {api_key}", "User-Agent": USER_AGENT}
+    if content_type:
+        headers["Content-Type"] = "application/json"
+    headers.update(PROVIDERS[provider]["extra_headers"])
+    return headers
 
 
 # --------------------------------------------------------------------------
@@ -195,68 +398,104 @@ def backoff_delay(attempt, retry_after=None):
     return delay + random.uniform(0, delay * 0.5)
 
 
-def format_api_error(status, body):
+def _format_detail(detail):
+    """格式化 TypeSafe 原生错误的顶层 detail：dict 取 message，FastAPI 风格的
+    issue 列表拼成 `loc: msg`（用 `; ` 连接），字符串原样返回。三种形状均已用真实
+    账号实测确认：422 缺字段是 issue 列表（额外带 type/input，这里只取 loc/msg）；
+    400（未知问题类型、未知模型）是带 error_type/message 的对象；400（等级数超限）
+    是纯字符串。"""
+    if isinstance(detail, dict):
+        msg = detail.get("message")
+        if msg is not None:
+            return str(msg)
+        return json.dumps(detail, ensure_ascii=False)
+    if isinstance(detail, list):
+        parts = []
+        for issue in detail:
+            if isinstance(issue, dict) and ("loc" in issue or "msg" in issue):
+                loc = issue.get("loc")
+                loc_str = ".".join(str(p) for p in loc) if isinstance(loc, list) else (str(loc) if loc else "")
+                msg = issue.get("msg", "")
+                parts.append(f"{loc_str}: {msg}" if loc_str else str(msg))
+            else:
+                parts.append(str(issue))
+        return "; ".join(parts)
+    return str(detail)
+
+
+def format_api_error(status, body, provider=None):
     parsed = None
     try:
         parsed = json.loads(body)
     except Exception:
         parsed = None
 
-    message = None
-    if isinstance(parsed, dict):
-        err = parsed.get("error")
-        if isinstance(err, dict):
-            message = err.get("message")
-        elif isinstance(err, str):
-            message = err
-    if message is None:
-        message = body.strip() or f"HTTP {status}"
-
     inner = None
-    if isinstance(message, str) and message.strip().startswith("["):
-        try:
-            issues = json.loads(message)
-            if isinstance(issues, list) and issues and isinstance(issues[0], dict):
-                parts = []
-                for issue in issues:
-                    path = issue.get("path")
-                    path_str = ".".join(str(p) for p in path) if isinstance(path, list) else ""
-                    msg = issue.get("message", "")
-                    parts.append(f"{path_str}: {msg}" if path_str else str(msg))
-                inner = "; ".join(parts)
-        except Exception:
-            inner = None
+    unknown_model = False
+    if isinstance(parsed, dict) and "detail" in parsed:
+        # TypeSafe 原生错误：顶层就是 {"detail": ...}。
+        detail = parsed["detail"]
+        inner = _format_detail(detail)
+        if isinstance(detail, dict) and str(detail.get("message") or "").startswith("Unknown model"):
+            unknown_model = True
+    else:
+        message = None
+        if isinstance(parsed, dict):
+            err = parsed.get("error")
+            if isinstance(err, dict):
+                message = err.get("message")
+            elif isinstance(err, str):
+                message = err
+        if message is None:
+            message = body.strip() or f"HTTP {status}"
 
-    if inner is None and isinstance(message, str) and message.startswith("HTTP "):
-        m = re.match(r"HTTP\s+\d+:\s*(.*)", message, re.DOTALL)
-        rest = m.group(1) if m else message
-        try:
-            j = json.loads(rest)
-            if isinstance(j, dict) and "detail" in j:
-                detail = j["detail"]
-                if isinstance(detail, dict):
-                    inner = str(detail.get("message") or json.dumps(detail, ensure_ascii=False))
+        if isinstance(message, str) and message.strip().startswith("["):
+            try:
+                issues = json.loads(message)
+                if isinstance(issues, list) and issues and isinstance(issues[0], dict):
+                    parts = []
+                    for issue in issues:
+                        path = issue.get("path")
+                        path_str = ".".join(str(p) for p in path) if isinstance(path, list) else ""
+                        msg = issue.get("message", "")
+                        parts.append(f"{path_str}: {msg}" if path_str else str(msg))
+                    inner = "; ".join(parts)
+            except Exception:
+                inner = None
+
+        if inner is None and isinstance(message, str) and message.startswith("HTTP "):
+            m = re.match(r"HTTP\s+\d+:\s*(.*)", message, re.DOTALL)
+            rest = m.group(1) if m else message
+            try:
+                j = json.loads(rest)
+                if isinstance(j, dict) and "detail" in j:
+                    inner = _format_detail(j["detail"])
                 else:
-                    inner = str(detail)
-            else:
+                    inner = rest
+            except Exception:
                 inner = rest
-        except Exception:
-            inner = rest
 
-    if inner is None:
-        inner = message if isinstance(message, str) else json.dumps(message, ensure_ascii=False)
+        if inner is None:
+            inner = message if isinstance(message, str) else json.dumps(message, ensure_ascii=False)
 
     text = f"jev: API 错误 (HTTP {status}): {inner}"
-    if status == 401:
-        text += "\njev: 提示：请检查 OPENROUTER_API_KEY 是否正确。"
+    if provider == "typesafe" and status in (401, 403):
+        text += "\njev: 提示：请在你自己的终端运行 jev auth set"
+    elif provider == "openrouter" and status == 401:
+        text += "\njev: 提示：请检查 OPENROUTER_API_KEY 是否正确，或运行 jev auth set --provider openrouter 重新设置。"
+    elif unknown_model:
+        text += "\njev: 提示：运行 jev auth check 查看这个账号可用的模型名"
     return text
 
 
 class Ctx:
-    def __init__(self, args):
-        self.model = resolve_model(getattr(args, "model", None))
-        self.base_url = resolve_base_url()
-        self.api_key = resolve_api_key()
+    def __init__(self, args, spec_model=None):
+        provider, reason = resolve_provider_name(getattr(args, "provider", None))
+        self.provider = provider
+        self.provider_reason = reason
+        self.model = resolve_model(getattr(args, "model", None), provider, spec_model)
+        self.base_url = resolve_base_url(provider)
+        self.api_key = resolve_api_key(provider)
         self.timeout = args.timeout
         self.retries = args.retries
         self.debug = os.environ.get("JEV_DEBUG") == "1"
@@ -264,12 +503,7 @@ class Ctx:
 
 
 def call_api_payload(ctx, payload):
-    headers = {
-        "Authorization": f"Bearer {ctx.api_key}",
-        "Content-Type": "application/json",
-        "X-Title": "jev-cli",
-        "HTTP-Referer": "https://github.com/okooo5km/jev",
-    }
+    headers = provider_headers(ctx.provider, ctx.api_key, content_type=True)
     if ctx.debug:
         try:
             print("[jev][debug] request: " + json.dumps(payload, ensure_ascii=False), file=sys.stderr)
@@ -295,23 +529,36 @@ def call_api_payload(ctx, payload):
 
         if status in (429, 529) or 500 <= status < 600:
             if attempt > ctx.retries:
-                raise JevError(format_api_error(status, body), 2)
+                raise JevError(format_api_error(status, body, provider=ctx.provider), 2)
             retry_after = hdrs.get("Retry-After") if hdrs is not None else None
             time.sleep(backoff_delay(attempt, retry_after))
             continue
 
-        raise JevError(format_api_error(status, body), 2)
+        raise JevError(format_api_error(status, body, provider=ctx.provider), 2)
 
 
 def call_api(ctx, state, questions):
     return call_api_payload(ctx, {"model": ctx.model, "state": state, "questions": questions})
 
 
-def format_verbose(resp, elapsed, conf=None):
+def estimate_cost(provider, input_tokens):
+    price = PROVIDERS[provider]["price_per_mtok"]
+    if not price:
+        return None
+    return input_tokens * price / 1e6
+
+
+def format_verbose(ctx, resp, elapsed, conf=None):
     usage = resp.get("usage") or {}
-    tok = (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
-    cost = usage.get("cost") or 0
-    s = f"[jev] {resp.get('model')} · {elapsed:.2f}s · {tok} tok · ${cost:.6f}"
+    input_tok = usage.get("input_tokens") or 0
+    output_tok = usage.get("output_tokens") or 0
+    tok = input_tok + output_tok
+    actual_cost = usage.get("cost")
+    if actual_cost is not None:
+        cost_str = f"${actual_cost:.6f}"
+    else:
+        cost_str = f"≈${(estimate_cost(ctx.provider, input_tok) or 0):.6f}"
+    s = f"[jev] {ctx.provider} · {resp.get('model')} · {elapsed:.2f}s · {tok} tok · {cost_str}"
     if conf is not None:
         s += f" · conf={conf:.2f}"
     return s
@@ -653,13 +900,14 @@ def _new_line_stats():
     return {"calls": 0, "failures": 0, "tokens": 0, "cost": 0.0}
 
 
-def _print_line_summary(args, stats, t_start):
+def _print_line_summary(args, ctx, stats, t_start):
     if not args.verbose:
         return
     wall = time.time() - t_start
+    prefix = "≈" if PROVIDERS[ctx.provider]["price_per_mtok"] else ""
     print(
-        f"[jev] 共 {stats['calls']} 次调用 · 失败 {stats['failures']} 次 · "
-        f"{stats['tokens']} tok · ${stats['cost']:.6f} · 耗时 {wall:.2f}s",
+        f"[jev] {ctx.provider} · 共 {stats['calls']} 次调用 · 失败 {stats['failures']} 次 · "
+        f"{stats['tokens']} tok · {prefix}${stats['cost']:.6f} · 耗时 {wall:.2f}s",
         file=sys.stderr,
     )
 
@@ -731,8 +979,14 @@ def iter_line_results(args, ctx, questions, stats):
                 stats["failures"] += 1
             elif resp is not None:
                 usage = resp.get("usage") or {}
-                stats["tokens"] += (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
-                stats["cost"] += usage.get("cost") or 0
+                input_tok = usage.get("input_tokens") or 0
+                output_tok = usage.get("output_tokens") or 0
+                stats["tokens"] += input_tok + output_tok
+                actual_cost = usage.get("cost")
+                if actual_cost is not None:
+                    stats["cost"] += actual_cost
+                else:
+                    stats["cost"] += estimate_cost(ctx.provider, input_tok) or 0
             yield (idx, raw_line, state, resp, err)
         if reader_errors:
             raise reader_errors[0]
@@ -767,7 +1021,7 @@ def run_line_mode(args, ctx, questions, value_fn, json_enrich):
             print(f"{answer_str}\t{number:.2f}\t{raw_line}")
         sys.stdout.flush()
 
-    _print_line_summary(args, stats, t_start)
+    _print_line_summary(args, ctx, stats, t_start)
     return 2 if had_error else 0
 
 
@@ -793,7 +1047,7 @@ def run_line_mode_multi(args, ctx, questions, value_fn, threshold):
             print(f"{value_fn(answers)}\t{raw_line}")
         sys.stdout.flush()
 
-    _print_line_summary(args, stats, t_start)
+    _print_line_summary(args, ctx, stats, t_start)
     return 2 if had_error else 0
 
 
@@ -801,23 +1055,24 @@ def run_line_mode_multi(args, ctx, questions, value_fn, threshold):
 # 子命令
 # --------------------------------------------------------------------------
 
-def single_call(args, questions, model_override=None, conf_from=None):
+def single_call(args, questions, spec_model=None, conf_from=None):
     """单次（非逐行）调用的共用路径：resolve_state → size_guard → Ctx → call_api
     → 计时 → --verbose 打印，供 yes/pick/score/run 复用。返回 (ctx, state, resp, elapsed)。
+
+    spec_model 是 spec 里写的 model（如果有），按 -m → spec model → JEV_MODEL →
+    provider 默认值的顺序参与解析，并按目标 provider 归一化。
 
     conf_from(resp) 可选，用来从响应里取出 confidence 传给 --verbose 的 conf= 部分
     （pick/score 需要，yes/run 不需要）。"""
     state = resolve_state(args)
     size_guard(state, questions)
-    ctx = Ctx(args)
-    if model_override:
-        ctx.model = model_override
+    ctx = Ctx(args, spec_model=spec_model)
     t0 = time.time()
     resp = call_api(ctx, state, questions)
     elapsed = time.time() - t0
     if ctx.verbose:
         conf = conf_from(resp) if conf_from else None
-        print(format_verbose(resp, elapsed, conf), file=sys.stderr)
+        print(format_verbose(ctx, resp, elapsed, conf), file=sys.stderr)
     return ctx, state, resp, elapsed
 
 
@@ -852,7 +1107,7 @@ def cmd_yes(args):
     is_yes = p >= args.threshold
     if args.json:
         out = {
-            "model": resp.get("model"), "id": resp.get("id"),
+            "model": resp.get("model"), "id": resp.get("id"), "provider": ctx.provider,
             "answer": enrich_answer(answer, threshold=args.threshold), "usage": resp.get("usage"),
         }
         print(json.dumps(out, ensure_ascii=False))
@@ -908,7 +1163,10 @@ def cmd_pick(args):
         exit_code = 1
 
     if args.json:
-        out = {"model": resp.get("model"), "id": resp.get("id"), "answer": answer, "usage": resp.get("usage")}
+        out = {
+            "model": resp.get("model"), "id": resp.get("id"), "provider": ctx.provider,
+            "answer": answer, "usage": resp.get("usage"),
+        }
         print(json.dumps(out, ensure_ascii=False))
     elif args.probs:
         probs = answer.get("probabilities") or {}
@@ -957,7 +1215,7 @@ def cmd_score(args):
 
     if args.json:
         out = {
-            "model": resp.get("model"), "id": resp.get("id"),
+            "model": resp.get("model"), "id": resp.get("id"), "provider": ctx.provider,
             "answer": enrich_answer(answer, range_offset=range_offset), "usage": resp.get("usage"),
         }
         print(json.dumps(out, ensure_ascii=False))
@@ -1003,7 +1261,7 @@ def cmd_filter(args):
                 print(raw_line)
             sys.stdout.flush()
 
-    _print_line_summary(args, stats, t_start)
+    _print_line_summary(args, ctx, stats, t_start)
     if errored:
         return 2
     return 0 if printed else 1
@@ -1030,9 +1288,7 @@ def cmd_run(args):
     questions = spec_questions_payload(spec)
 
     if args.lines:
-        ctx = Ctx(args)
-        if not args.model and spec.get("model"):
-            ctx.model = spec["model"]
+        ctx = Ctx(args, spec_model=spec.get("model"))
 
         def value_fn_run(answers):
             parts = []
@@ -1052,13 +1308,15 @@ def cmd_run(args):
 
         return run_line_mode_multi(args, ctx, questions, value_fn_run, threshold)
 
-    model_override = spec["model"] if (not args.model and spec.get("model")) else None
-    ctx, state, resp, elapsed = single_call(args, questions, model_override=model_override)
+    ctx, state, resp, elapsed = single_call(args, questions, spec_model=spec.get("model"))
     answers = resp.get("answers", {})
 
     if args.json:
         enriched = {n: enrich_answer(a, threshold=threshold) for n, a in answers.items()}
-        out = {"model": resp.get("model"), "id": resp.get("id"), "answers": enriched, "usage": resp.get("usage")}
+        out = {
+            "model": resp.get("model"), "id": resp.get("id"), "provider": ctx.provider,
+            "answers": enriched, "usage": resp.get("usage"),
+        }
         print(json.dumps(out, ensure_ascii=False))
     else:
         print(render_run_table(spec, answers, threshold))
@@ -1066,6 +1324,9 @@ def cmd_run(args):
 
 
 def cmd_raw(args):
+    """stdin 传入完整请求体，原样透传：不做 criteria 归一化，也不修改响应体，只在
+    请求体缺 model 字段时用所选 provider 的默认模型补上——已有的 model 字段一律
+    原样发送，不做别名归一化（发什么就是什么，用于调试或探索 typed 命令未覆盖的用法）。"""
     try:
         raw_in = sys.stdin.read()
     except Exception as e:
@@ -1078,16 +1339,18 @@ def cmd_raw(args):
         raise JevError(f"jev: stdin 不是合法 JSON: {e}", 2)
     if not isinstance(payload, dict):
         raise JevError("jev: 请求体必须是 JSON 对象", 2)
-    if not payload.get("model"):
-        payload["model"] = resolve_model(args.model)
 
     ctx = Ctx(args)
-    ctx.model = payload["model"]
+    if payload.get("model"):
+        ctx.model = payload["model"]
+    else:
+        payload["model"] = ctx.model
+
     t0 = time.time()
     resp = call_api_payload(ctx, payload)
     elapsed = time.time() - t0
     if ctx.verbose:
-        print(format_verbose(resp, elapsed), file=sys.stderr)
+        print(format_verbose(ctx, resp, elapsed), file=sys.stderr)
     print(json.dumps(resp, ensure_ascii=False))
     return 0
 
@@ -1100,26 +1363,23 @@ def cmd_raw(args):
 # 全程不经过 AI agent —— 不进聊天、不进命令行参数、不进 shell 历史。`auth set`
 # 因此拒绝在非交互终端下运行：agent 没有 TTY，本来就做不到替用户输入密钥。
 
-def _drop_key_lines(text):
-    """按行保留内容，丢弃已有的 OPENROUTER_API_KEY= / export OPENROUTER_API_KEY= 行。"""
+def _drop_key_lines(lines, key_name):
+    """按行保留内容，丢弃已有的 <key_name>= / export <key_name>= 行——其余行
+    （包括另一个 provider 的 key）原样保留。"""
     kept = []
-    for line in text.splitlines():
+    for line in lines:
         bare = line[len("export "):] if line.startswith("export ") else line
         name = bare.split("=", 1)[0].strip()
-        if name == "OPENROUTER_API_KEY":
+        if name == key_name:
             continue
         kept.append(line)
     return kept
 
 
-def write_key_to_env_file(key):
-    """把 OPENROUTER_API_KEY 写进 <config dir>/.env，原子替换，返回实际写入的文件路径。
-
-    - 目标若是软链接，写到软链接指向的真实路径，软链接本身不变（依然指向它）。
-    - 保留文件中的其它行；已有的 OPENROUTER_API_KEY 行（含 export 形式）被替换。
-    - 临时文件建在目标所在目录、O_EXCL 独占创建，写完 flush+fsync 再 os.replace
-      做原子换入，不会留下半写状态；最后再强制 chmod 600（不依赖 umask）。
-    """
+def _rewrite_env_file(mutate):
+    """读 <config dir>/.env（软链接会读写它指向的真实文件，链接本身不变），用
+    mutate(lines) 算出新内容，临时文件 O_EXCL 独占创建、flush+fsync、os.replace
+    原子换入，最后强制 chmod 600（不依赖 umask）。返回实际写入的文件路径。"""
     cfg_dir = config_dir()
     os.makedirs(cfg_dir, mode=0o700, exist_ok=True)
     target = os.path.join(cfg_dir, ".env")
@@ -1127,15 +1387,18 @@ def write_key_to_env_file(key):
     real_dir = os.path.dirname(real_target) or "."
     os.makedirs(real_dir, mode=0o700, exist_ok=True)
 
+    # 只有“文件不存在”才当空文件；读不了（权限、编码损坏等）必须停下——否则会用
+    # 只含新内容的文件覆盖掉原文件，把另一个 provider 的 key 一起抹掉。
     try:
         with open(real_target, "r", encoding="utf-8") as f:
             existing = f.read()
-    except OSError:
+    except FileNotFoundError:
         existing = ""
+    except (OSError, UnicodeDecodeError) as e:
+        raise JevError(f"jev: 无法读取 {real_target}（{e}），未作更改。", 2)
 
-    lines = _drop_key_lines(existing)
-    lines.append(f"OPENROUTER_API_KEY={key}")
-    content = "\n".join(lines) + "\n"
+    lines = mutate(existing.splitlines())
+    content = ("\n".join(lines) + "\n") if lines else ""
 
     tmp_path = os.path.join(real_dir, f".jev-env-{os.getpid()}-{int(time.time() * 1000)}.tmp")
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1155,39 +1418,105 @@ def write_key_to_env_file(key):
     return real_target
 
 
+def write_key_to_env_file(key, key_name):
+    """把 <key_name> 写进 <config dir>/.env：保留其它行（另一个 provider 的
+    key 等），已有的 <key_name> 行（含 export 形式）被替换——一个文件可以同时
+    存两个 provider 的 key。"""
+    def mutate(lines):
+        kept = _drop_key_lines(lines, key_name)
+        kept.append(f"{key_name}={key}")
+        return kept
+    return _rewrite_env_file(mutate)
+
+
+def remove_key_from_env_file(key_name):
+    """从 <config dir>/.env 里删掉 <key_name> 那一行，保留其它行；文件本身即使
+    删空也保留（不删除文件），供 `jev auth remove` 使用。"""
+    return _rewrite_env_file(lambda lines: _drop_key_lines(lines, key_name))
+
+
 def cmd_auth_set(args):
-    if not sys.stdin.isatty():
-        raise JevError(
-            "jev: auth set 需要在你自己的终端里交互运行（输入不回显）；"
-            "CI 等非交互环境请用 OPENROUTER_API_KEY 环境变量。",
-            2,
-        )
-    try:
-        raw = getpass.getpass("OpenRouter API key（输入不回显）: ")
-    except (EOFError, KeyboardInterrupt):
-        print(file=sys.stderr)
-        raise JevError("jev: 已取消，未作更改。", 2)
+    provider = resolve_auth_provider(getattr(args, "provider", None))
+    info = PROVIDERS[provider]
+    use_stdin = getattr(args, "stdin", False)
 
-    key = raw.strip()
-    if not key:
-        raise JevError("jev: 未输入内容，未作更改。", 2)
-
-    if not key.startswith("sk-or-"):
-        print("jev: 警告：这不像是 OpenRouter 密钥（通常以 sk-or- 开头）。", file=sys.stderr)
+    if use_stdin:
+        # 供密码管理器/自动化使用：`op read "op://..." | jev auth set --stdin`。
+        # 不需要 TTY，也不做交互确认——前缀不对就直接报错，不写入任何东西。
+        key = sys.stdin.readline().strip()
+        if not key:
+            raise JevError("jev: stdin 为空，未作更改。", 2)
+        if info["key_prefix"] and not key.startswith(info["key_prefix"]):
+            raise JevError(
+                f"jev: 这不像是 {info['label']} 密钥（通常以 {info['key_prefix']} 开头），"
+                "未作更改；--stdin 模式不支持交互确认，去掉该参数重试。",
+                2,
+            )
+        if not info["key_prefix"] and key.startswith("sk-or-"):
+            raise JevError(
+                "jev: 这看起来是 OpenRouter 的密钥，未作更改；"
+                "--stdin 模式不支持交互确认，去掉该参数重试。",
+                2,
+            )
+    else:
+        if not sys.stdin.isatty():
+            raise JevError(
+                "jev: auth set 需要在你自己的终端里交互运行（输入不回显），"
+                "或加 --stdin 从管道读取（供密码管理器使用）；"
+                f"CI 等非交互环境请用 {info['key_env']} 环境变量。",
+                2,
+            )
         try:
-            answer = input("继续保存吗？[y/N] ")
+            raw = getpass.getpass(f"{info['label']} API key（输入不回显，创建于 {info['key_page']}）: ")
         except (EOFError, KeyboardInterrupt):
             print(file=sys.stderr)
-            answer = ""
-        if answer.strip().lower() not in ("y", "yes"):
             raise JevError("jev: 已取消，未作更改。", 2)
 
-    target = write_key_to_env_file(key)
+        key = raw.strip()
+        if not key:
+            raise JevError("jev: 未输入内容，未作更改。", 2)
+
+        if info["key_prefix"] and not key.startswith(info["key_prefix"]):
+            print(f"jev: 警告：这不像是 {info['label']} 密钥（通常以 {info['key_prefix']} 开头）。", file=sys.stderr)
+            try:
+                answer = input("继续保存吗？[y/N] ")
+            except (EOFError, KeyboardInterrupt):
+                print(file=sys.stderr)
+                answer = ""
+            if answer.strip().lower() not in ("y", "yes"):
+                raise JevError("jev: 已取消，未作更改。", 2)
+        elif not info["key_prefix"] and key.startswith("sk-or-"):
+            # TypeSafe 没有已知前缀；唯一值得多问一句的情形是它长得像 OpenRouter 的 key。
+            try:
+                answer = input("jev: 这看起来是 OpenRouter 的密钥，要保存为 TypeSafe 密钥吗？[y/N] ")
+            except (EOFError, KeyboardInterrupt):
+                print(file=sys.stderr)
+                answer = ""
+            if answer.strip().lower() not in ("y", "yes"):
+                raise JevError("jev: 已取消，未作更改。", 2)
+
+    target = write_key_to_env_file(key, info["key_env"])
     print(f"已保存到 {target}（权限 600）。运行 jev auth check 验证。")
-    if os.environ.get("OPENROUTER_API_KEY"):
-        print("提示：环境变量 OPENROUTER_API_KEY 已设置，读取时优先于这个文件。", file=sys.stderr)
+    if os.environ.get(info["key_env"]):
+        print(f"提示：环境变量 {info['key_env']} 已设置，读取时优先于这个文件。", file=sys.stderr)
     elif os.environ.get("JEV_ENV_FILE"):
         print("提示：JEV_ENV_FILE 已设置，读取时优先于这个文件。", file=sys.stderr)
+
+    # 两边都配置了密钥、又没有固定默认时，提示怎么把结果定下来，脚本才可复现。
+    other = "openrouter" if provider == "typesafe" else "typesafe"
+    other_key, _, _ = locate_api_key(other)
+    if other_key and not os.environ.get("JEV_PROVIDER") and not read_pinned_provider():
+        print(
+            f"提示：两个 provider 都配置了密钥，运行 jev provider default {provider} "
+            "固定默认走哪个，脚本行为才可复现。",
+            file=sys.stderr,
+        )
+
+    try:
+        active_provider, reason = resolve_provider_name(None)
+        print(f"当前 provider：{PROVIDERS[active_provider]['label']}（{_reason_label(reason)}）")
+    except JevError:
+        pass
     return 0
 
 
@@ -1209,23 +1538,47 @@ def _permission_report(path):
     return lines
 
 
-def cmd_auth_status(args):
-    key, source, path = locate_api_key()
-    if not key:
-        print(f"未配置 OPENROUTER_API_KEY。请在你自己的终端运行 jev auth set（写入 {path}）。")
-        return 1
+def _reason_label(reason):
+    return {
+        "--provider": "--provider",
+        "JEV_PROVIDER": "JEV_PROVIDER",
+        "config.ini": "config.ini",
+        "auto": "自动",
+    }.get(reason, reason or "")
 
-    if source == "env":
-        print("来源：环境变量 OPENROUTER_API_KEY")
-    elif source == "JEV_ENV_FILE":
-        print(f"来源：$JEV_ENV_FILE -> {path}")
-        for line in _permission_report(path):
-            print(line)
+
+def cmd_auth_status(args):
+    try:
+        active_provider, reason = resolve_provider_name(getattr(args, "provider", None))
+    except JevError:
+        active_provider, reason = None, None
+
+    if active_provider:
+        print(f"当前 provider：{PROVIDERS[active_provider]['label']}（{_reason_label(reason)}）")
     else:
-        print(f"来源：配置文件 {path}")
-        for line in _permission_report(path):
-            print(line)
-    return 0
+        print("当前 provider：未确定（未找到任何 API key）")
+
+    for name, info in PROVIDERS.items():
+        key, source, path = locate_api_key(name)
+        print(f"[{info['label']}]")
+        if not key:
+            print(f"  未配置 {info['key_env']}。请在你自己的终端运行 {_auth_set_cmd(name)}（写入 {path}）。")
+            continue
+        if source == "env":
+            print(f"  来源：环境变量 {info['key_env']}")
+        elif source == "JEV_ENV_FILE":
+            print(f"  来源：$JEV_ENV_FILE -> {path}")
+            for line in _permission_report(path):
+                print(f"  {line}")
+        else:
+            print(f"  来源：配置文件 {path}")
+            for line in _permission_report(path):
+                print(f"  {line}")
+
+    active_key = None
+    if active_provider:
+        active_key, _, _ = locate_api_key(active_provider)
+    return 0 if active_key else 1
 
 
 def _fmt_usd(x):
@@ -1233,31 +1586,63 @@ def _fmt_usd(x):
     return s if s else "0"
 
 
-def cmd_auth_check(args):
-    key, _source, path = locate_api_key()
-    if not key:
-        raise JevError(
-            "jev: 未找到 OPENROUTER_API_KEY。请设置环境变量，或在 $JEV_ENV_FILE 指向的文件"
-            f"或 {path} 中配置（配置目录可用 XDG_CONFIG_HOME 覆盖）。"
-            "在你自己的终端运行 jev auth set 可以交互式配置。",
-            2,
-        )
+def _extract_model_names(payload):
+    """防御式解析 GET /v1/models 的响应：可能是裸列表，也可能是带 data/models
+    键的对象；列表项可能是字符串，也可能是带 id/name 的对象。"""
+    items = None
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = payload.get("data")
+        if items is None:
+            items = payload.get("models")
+    if not isinstance(items, list):
+        return []
+    names = []
+    for item in items:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict):
+            n = item.get("id") or item.get("name")
+            if n:
+                names.append(str(n))
+    return names
 
-    url = os.environ.get("JEV_KEY_URL") or KEY_URL_DEFAULT
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "X-Title": "jev-cli",
-        "HTTP-Referer": "https://github.com/okooo5km/jev",
-    }
+
+def cmd_auth_check(args):
+    provider, _reason = resolve_provider_name(getattr(args, "provider", None))
+    key = resolve_api_key(provider)
+    url = resolve_key_url(provider)
+    headers = provider_headers(provider, key)
+
     try:
         status, body = http_get(url, headers, timeout=15)
     except JevNetworkError as e:
         raise JevError(f"jev: 网络错误: {e}", 2)
 
+    if provider == "typesafe":
+        if status in (401, 403):
+            raise JevError(
+                f"jev: 密钥无效（HTTP {status}），请在你自己的终端运行 jev auth set 重新设置", 2
+            )
+        if status != 200:
+            raise JevError(format_api_error(status, body, provider=provider), 2)
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            raise JevError("jev: 响应不是合法 JSON", 2)
+        print("密钥有效（TypeSafe）")
+        for n in _extract_model_names(payload):
+            print(n)
+        return 0
+
+    # openrouter
     if status == 401:
-        raise JevError("jev: 密钥无效（HTTP 401），请在你自己的终端运行 jev auth set 重新设置", 2)
+        raise JevError(
+            "jev: 密钥无效（HTTP 401），请在你自己的终端运行 jev auth set --provider openrouter 重新设置", 2
+        )
     if status != 200:
-        raise JevError(format_api_error(status, body), 2)
+        raise JevError(format_api_error(status, body, provider=provider), 2)
 
     try:
         payload = json.loads(body)
@@ -1285,11 +1670,123 @@ def cmd_auth_check(args):
     return 0
 
 
+def cmd_auth_remove(args):
+    provider = resolve_auth_provider(getattr(args, "provider", None))
+    info = PROVIDERS[provider]
+    key, source, path = locate_api_key(provider)
+    if not key:
+        print(f"jev: {info['key_env']} 未配置，无需移除。", file=sys.stderr)
+        return 1
+
+    if source in ("env", "JEV_ENV_FILE"):
+        where = "环境变量" if source == "env" else f"$JEV_ENV_FILE（{path}）"
+        raise JevError(
+            f"jev: {info['key_env']} 来自{where}，不是 jev 管理的配置文件，"
+            "不会代为修改——请自己 unset 或编辑该文件。",
+            2,
+        )
+
+    removed_path = remove_key_from_env_file(info["key_env"])
+    print(f"已从 {removed_path} 移除 {info['key_env']}。")
+    try:
+        active_provider, reason = resolve_provider_name(None)
+        print(f"当前 provider：{PROVIDERS[active_provider]['label']}（{_reason_label(reason)}）")
+    except JevError as e:
+        print(str(e), file=sys.stderr)
+    return 0
+
+
 def cmd_auth(args):
     verb = getattr(args, "auth_verb", None)
-    handlers = {"set": cmd_auth_set, "status": cmd_auth_status, "check": cmd_auth_check}
+    handlers = {
+        "set": cmd_auth_set, "status": cmd_auth_status,
+        "check": cmd_auth_check, "remove": cmd_auth_remove,
+    }
     if verb not in handlers:
-        raise JevError("jev: 请指定 auth 子命令 (set/status/check)", 2)
+        raise JevError("jev: 请指定 auth 子命令 (set/status/check/remove)", 2)
+    return handlers[verb](args)
+
+
+# --------------------------------------------------------------------------
+# provider 子命令 (list/default)
+# --------------------------------------------------------------------------
+
+def _provider_endpoint_host(provider):
+    return urlparse(PROVIDERS[provider]["base_url"]).netloc
+
+
+def cmd_provider_list(args):
+    try:
+        active_provider, reason = resolve_provider_name(getattr(args, "provider", None))
+    except JevError:
+        active_provider, reason = None, None
+
+    rows = []
+    for name, info in PROVIDERS.items():
+        key, source, _path = locate_api_key(name)
+        rows.append({
+            "id": name,
+            "label": info["label"],
+            "active": name == active_provider,
+            "endpoint": _provider_endpoint_host(name),
+            "key_env": info["key_env"],
+            "configured": bool(key),
+            "key_source": source if key else None,
+            "default_model": info["default_model"],
+        })
+
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {"provider": active_provider, "reason": reason, "providers": rows}, ensure_ascii=False
+        ))
+        return 0
+
+    for r in rows:
+        marker = "*" if r["active"] else " "
+        key_state = f"已配置（{r['key_source']}）" if r["configured"] else "未配置"
+        print(f"{marker} {r['id']:<10} {r['endpoint']:<24} {r['key_env']:<20} {key_state:<18} {r['default_model']}")
+    if active_provider:
+        print(f"当前：{PROVIDERS[active_provider]['label']}（{_reason_label(reason)}）")
+    else:
+        print("当前：未确定（未找到任何 API key）")
+    return 0
+
+
+def cmd_provider_default(args):
+    target = getattr(args, "target", None)
+
+    if target is None:
+        pinned = read_pinned_provider()
+        print(pinned if pinned else "auto")
+        return 0
+
+    if target == "auto":
+        write_pinned_provider(None)
+    else:
+        if target not in PROVIDERS:
+            raise JevError(f"jev: 未知的 provider: {target}（可选 {'/'.join(PROVIDERS)} 或 auto）", 2)
+        write_pinned_provider(target)
+        key, _, _ = locate_api_key(target)
+        if not key:
+            print(
+                f"jev: 警告：{PROVIDERS[target]['label']} 还没有配置密钥，"
+                f"运行 {_auth_set_cmd(target)}",
+                file=sys.stderr,
+            )
+
+    try:
+        active_provider, reason = resolve_provider_name(None)
+        print(f"当前 provider：{PROVIDERS[active_provider]['label']}（{_reason_label(reason)}）")
+    except JevError as e:
+        print(str(e), file=sys.stderr)
+    return 0
+
+
+def cmd_provider(args):
+    verb = getattr(args, "provider_verb", None)
+    handlers = {"list": cmd_provider_list, "default": cmd_provider_default}
+    if verb not in handlers:
+        raise JevError("jev: 请指定 provider 子命令 (list/default)", 2)
     return handlers[verb](args)
 
 
@@ -1315,10 +1812,14 @@ def build_common_parser():
     common.add_argument("-j", "--jobs", type=int, default=8, help="逐行模式的并发数（默认 8）")
     common.add_argument("--json", action="store_true", help="输出机器可读 JSON（逐行模式为 JSONL）")
     common.add_argument("-m", "--model", default=None,
-                         help="模型 ID（默认 $JEV_MODEL 或 ~typesafe/jev-latest）")
+                         help="模型 ID（默认 $JEV_MODEL 或所选 provider 的默认模型：typesafe=jev-latest，"
+                              "openrouter=~typesafe/jev-latest；jev-latest 和 jev-X.Y 写法会按 provider 自动换算，jev-preview 只有 typesafe 有）")
+    common.add_argument("--provider", choices=list(PROVIDERS), default=None,
+                         help="选择后端：typesafe 或 openrouter（默认 --provider → $JEV_PROVIDER → "
+                              "配置文件里的 JEV_PROVIDER= → 自动检测哪个 key 存在）")
     common.add_argument("--timeout", type=float, default=60, help="单次请求超时秒数（默认 60）")
     common.add_argument("--retries", type=int, default=3, help="失败重试次数（默认 3）")
-    common.add_argument("--verbose", action="store_true", help="在 stderr 输出耗时/token/费用统计")
+    common.add_argument("--verbose", action="store_true", help="在 stderr 输出 provider/耗时/token/费用统计")
     return common
 
 
@@ -1361,15 +1862,38 @@ def build_parser():
 
     p_raw = sub.add_parser("raw", help="stdin 传入完整请求 JSON，直接返回原始响应 JSON")
     p_raw.add_argument("-m", "--model", default=None, help="缺少 model 字段时使用的默认模型")
+    p_raw.add_argument("--provider", choices=list(PROVIDERS), default=None,
+                        help="选择后端：typesafe 或 openrouter（同 common 选项的解析顺序）")
     p_raw.add_argument("--timeout", type=float, default=60, help="请求超时秒数（默认 60）")
     p_raw.add_argument("--retries", type=int, default=3, help="失败重试次数（默认 3）")
-    p_raw.add_argument("--verbose", action="store_true", help="在 stderr 输出耗时/token/费用统计")
+    p_raw.add_argument("--verbose", action="store_true", help="在 stderr 输出 provider/耗时/token/费用统计")
 
-    p_auth = sub.add_parser("auth", help="管理 OPENROUTER_API_KEY（set/status/check）")
+    p_auth = sub.add_parser("auth", help="管理 API key（set/status/check/remove），支持 typesafe/openrouter 两个 provider")
     auth_sub = p_auth.add_subparsers(dest="auth_verb", help="auth 子命令")
-    auth_sub.add_parser("set", help="在你自己的终端交互设置密钥（输入不回显，需要 TTY）")
-    auth_sub.add_parser("status", help="查看密钥来源、文件路径与权限；不打印密钥")
-    auth_sub.add_parser("check", help="联网校验密钥是否有效（只读，不计费）")
+    p_auth_set = auth_sub.add_parser("set", help="设置密钥：交互（需要 TTY）或 --stdin 从管道读取")
+    p_auth_set.add_argument("--provider", choices=list(PROVIDERS), default=None,
+                             help="要设置密钥的 provider（默认 --provider → $JEV_PROVIDER → typesafe）")
+    p_auth_set.add_argument("--stdin", action="store_true",
+                             help="从 stdin 第一行读取密钥，跳过交互提示（供密码管理器/自动化使用，不需要 TTY）")
+    p_auth_status = auth_sub.add_parser("status", help="查看两个 provider 的密钥来源、文件路径与权限；不打印密钥")
+    p_auth_status.add_argument("--provider", choices=list(PROVIDERS), default=None,
+                                help="仅影响“当前 provider”那一行判断的显式来源")
+    p_auth_check = auth_sub.add_parser("check", help="联网校验密钥是否有效（只读，不计费）")
+    p_auth_check.add_argument("--provider", choices=list(PROVIDERS), default=None,
+                               help="校验指定 provider 的密钥（默认按当前 provider 解析）")
+    p_auth_remove = auth_sub.add_parser("remove", help="从配置文件移除某个 provider 的密钥")
+    p_auth_remove.add_argument("--provider", choices=list(PROVIDERS), default=None,
+                                help="要移除密钥的 provider（默认 --provider → $JEV_PROVIDER → typesafe）")
+
+    p_provider = sub.add_parser("provider", help="查看/固定默认 provider（list/default）")
+    provider_sub = p_provider.add_subparsers(dest="provider_verb", help="provider 子命令")
+    p_provider_list = provider_sub.add_parser("list", help="列出两个 provider 的密钥/模型状态")
+    p_provider_list.add_argument("--provider", choices=list(PROVIDERS), default=None,
+                                  help="仅影响“当前”那一行判断的显式来源")
+    p_provider_list.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    p_provider_default = provider_sub.add_parser("default", help="查看/固定/清除默认 provider（写 config.ini）")
+    p_provider_default.add_argument("target", nargs="?", default=None, metavar="ID|auto",
+                                     help="typesafe/openrouter 固定为默认；auto 清除固定；留空打印当前固定值")
 
     return parser
 
@@ -1389,12 +1913,16 @@ def main(argv=None):
     verb = getattr(args, "verb", None)
     if not verb:
         parser.print_usage(sys.stderr)
-        print("jev: 请指定子命令 (yes/pick/score/filter/run/raw/auth)，或使用 --version", file=sys.stderr)
+        print(
+            "jev: 请指定子命令 (yes/pick/score/filter/run/raw/auth/provider)，或使用 --version",
+            file=sys.stderr,
+        )
         return 2
 
     handlers = {
         "yes": cmd_yes, "pick": cmd_pick, "score": cmd_score,
-        "filter": cmd_filter, "run": cmd_run, "raw": cmd_raw, "auth": cmd_auth,
+        "filter": cmd_filter, "run": cmd_run, "raw": cmd_raw,
+        "auth": cmd_auth, "provider": cmd_provider,
     }
     try:
         return handlers[verb](args)
