@@ -42,7 +42,7 @@ try:
 except ImportError:  # Python < 3.11
     tomllib = None
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 USER_AGENT = f"jev-cli/{VERSION} (+https://github.com/okooo5km/jev)"
 SIZE_WARN_TOKENS = 30000
 

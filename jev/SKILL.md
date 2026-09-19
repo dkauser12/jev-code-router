@@ -5,7 +5,7 @@ license: Apache-2.0; see LICENSE.txt
 compatibility: Requires Python 3.9+, network access to api.typesafe.ai (default) or openrouter.ai, and a TYPESAFE_API_KEY or OPENROUTER_API_KEY.
 metadata:
   author: okooo5km(十里)
-  version: "0.3.1"
+  version: "0.3.2"
 ---
 
 # jev
