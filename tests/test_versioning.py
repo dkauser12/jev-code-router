@@ -91,5 +91,38 @@ class LicenseTravelsWithSkillTests(unittest.TestCase):
         )
 
 
+class SkillFrontmatterYamlSafetyTests(unittest.TestCase):
+    """The frontmatter must parse with a strict YAML parser: `npx skills add`
+    rejects the whole skill otherwise. No YAML library in the stdlib, so lint
+    the plain scalars for the constructs that break them."""
+
+    def _frontmatter_lines(self):
+        text = (Path(__file__).resolve().parent.parent / "jev" / "SKILL.md").read_text(encoding="utf-8")
+        m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+        self.assertIsNotNone(m, "SKILL.md has no frontmatter block")
+        return m.group(1).splitlines()
+
+    def test_plain_scalars_contain_no_yaml_breaking_sequences(self):
+        for line in self._frontmatter_lines():
+            m = re.match(r"^(\s*)([A-Za-z_-]+):\s?(.*)$", line)
+            self.assertIsNotNone(m, f"unexpected frontmatter line: {line!r}")
+            value = m.group(3)
+            if not value or value[0] in "\"'>|":
+                continue  # empty (mapping), quoted or block scalar
+            self.assertNotIn(": ", value, f"': ' inside a plain YAML scalar breaks parsing: {line[:70]!r}")
+            self.assertNotIn(" #", value, f"' #' starts a YAML comment: {line[:70]!r}")
+            self.assertFalse(value.endswith(":"), line[:70])
+            self.assertNotIn(value[0], "[]{}&*!%@`,?-", f"plain scalar starts with a YAML indicator: {line[:70]!r}")
+
+    def test_parses_with_pyyaml_when_available(self):
+        try:
+            import yaml  # noqa: WPS433 - optional, not a project dependency
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        data = yaml.safe_load("\n".join(self._frontmatter_lines()))
+        self.assertEqual(data["name"], "jev")
+        self.assertLessEqual(len(data["description"]), 1024)
+
+
 if __name__ == "__main__":
     unittest.main()
