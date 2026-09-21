@@ -337,6 +337,12 @@ def build_parser():
 
 
 def main(argv=None):
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except (AttributeError, OSError):
+                pass
     args = build_parser().parse_args(argv)
     try:
         state = _load_state(args.state_file)

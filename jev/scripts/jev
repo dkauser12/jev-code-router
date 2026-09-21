@@ -2103,6 +2103,14 @@ def build_parser():
 # --------------------------------------------------------------------------
 
 def main(argv=None):
+    if os.name == "nt":
+        # Pipes created by native Windows hosts may default to a legacy code
+        # page even though Jev's specs and JSON are UTF-8.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except (AttributeError, OSError):
+                pass
     parser = build_parser()
     args = parser.parse_args(argv)
 
