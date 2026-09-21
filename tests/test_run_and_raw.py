@@ -13,6 +13,9 @@ BUILTIN_QUESTIONS = {
     "signal": {"worth_reading", "topic", "novelty"},
     "commit": {"type", "has_secret", "breaking", "risk"},
     "route": {"handler", "complexity", "needs_web", "needs_private_data"},
+    "code-route": {"decision"},
+    "code-context": {"selected"},
+    "code-escalate": {"decision"},
 }
 
 

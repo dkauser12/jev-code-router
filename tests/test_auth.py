@@ -205,6 +205,7 @@ class AuthStatusTests(JevTestCase):
         self.assertIn("600", proc.stdout)
         self.assertNotIn("from-custom-file", proc.stdout)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not portable to Windows")
     def test_status_from_config_file_reports_path_and_mode(self):
         cfg = self.xdg_config / "jev"
         cfg.mkdir(parents=True, exist_ok=True)
@@ -220,6 +221,7 @@ class AuthStatusTests(JevTestCase):
         self.assertNotIn("警告", proc.stdout)
         self.assertNotIn("from-config", proc.stdout)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not portable to Windows")
     def test_status_warns_when_group_or_other_can_read(self):
         cfg = self.xdg_config / "jev"
         cfg.mkdir(parents=True, exist_ok=True)

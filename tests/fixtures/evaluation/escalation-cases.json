@@ -1,0 +1,7 @@
+[
+  {"id":"x1","current_profile":"economy","task":"Implement handler","failure_evidence":{"unsuccessful_edit_count":2,"failed_test_summary":"Same test still fails."}},
+  {"id":"x2","current_profile":"standard","task":"Diagnose race","failure_evidence":{"unresolved_ambiguity":"Three cross-component causes remain after investigation."}},
+  {"id":"x3","current_profile":"economy","task":"Fix compile error","failure_evidence":{"failed_test_summary":"One direct missing import error."}},
+  {"id":"x4","current_profile":"standard","task":"Locate feature implementation","failure_evidence":{"unable_to_locate_code":true}},
+  {"id":"x5","current_profile":"deep","task":"Continue security review","failure_evidence":{"unsuccessful_edit_count":3}}
+]

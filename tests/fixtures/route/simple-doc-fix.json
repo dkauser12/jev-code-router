@@ -1,0 +1,6 @@
+{
+  "task": "Correct an explicit typo in one documentation file and verify the changed line.",
+  "repository_summary": "The documentation file and exact typo are already known.",
+  "changes_code": false,
+  "safety_sensitivity": "none known"
+}

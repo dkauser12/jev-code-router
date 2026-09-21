@@ -1,0 +1,13 @@
+{
+  "description": "Decide whether observable failure evidence justifies one profile-level escalation",
+  "questions": {
+    "decision": {
+      "type": "choice",
+      "instructions": "Decide from the supplied observable failure evidence only. Ordinary first errors and directly actionable failures stay. Uncertain cases stay.",
+      "criteria": {
+        "stay": "No escalation: the failure is ordinary, isolated, directly actionable, lacks repeated evidence, or the evidence is uncertain",
+        "escalate": "Escalate one level: repeated unsuccessful edits, persistent tests with multiple plausible causes, unresolved ambiguity, inability to locate relevant code, or a newly exposed security or cross-component concern"
+      }
+    }
+  }
+}

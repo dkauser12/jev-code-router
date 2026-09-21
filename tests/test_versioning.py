@@ -19,7 +19,7 @@ def _frontmatter(text):
 
 
 class VersionConsistencyTests(unittest.TestCase):
-    def test_cli_skill_and_installer_agree_on_version(self):
+    def test_derivative_version_tracks_upstream_cli_and_installer(self):
         cli_text = CLI.read_text(encoding="utf-8")
         m = re.search(r'^VERSION = "([^"]+)"', cli_text, re.MULTILINE)
         self.assertIsNotNone(m, "scripts/jev must define VERSION = \"X.Y.Z\"")
@@ -35,16 +35,15 @@ class VersionConsistencyTests(unittest.TestCase):
         self.assertIsNotNone(m, "install.sh must default JEV_VERSION to vX.Y.Z")
         installer_version = m.group(1)
 
-        self.assertEqual(cli_version, skill_version)
+        self.assertTrue(skill_version.startswith(cli_version + "-router."))
         self.assertEqual(cli_version, installer_version)
 
 
 class SkillFrontmatterTests(unittest.TestCase):
-    def test_name_matches_folder(self):
+    def test_derivative_skill_name(self):
         front = _frontmatter(SKILL_MD.read_text(encoding="utf-8"))
         names = [l for l in front.splitlines() if l.startswith("name:")]
-        self.assertEqual(names, ["name: jev"])
-        self.assertEqual(SKILL_MD.parent.name, "jev")
+        self.assertEqual(names, ["name: jev-code-router"])
 
     def test_description_is_present_and_bounded(self):
         front = _frontmatter(SKILL_MD.read_text(encoding="utf-8"))
@@ -53,10 +52,12 @@ class SkillFrontmatterTests(unittest.TestCase):
         self.assertLessEqual(len(m.group(1)), 1024)
         self.assertGreater(len(m.group(1)), 0)
 
-    def test_license_and_compatibility_fields_present(self):
+    def test_license_field_and_runtime_requirements_present(self):
         front = _frontmatter(SKILL_MD.read_text(encoding="utf-8"))
         self.assertIn("license: Apache-2.0; see LICENSE.txt", front)
-        self.assertTrue(any(l.startswith("compatibility:") for l in front.splitlines()))
+        body = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn("Python 3.9+", body)
+        self.assertIn("OPENROUTER_API_KEY", body)
 
     def test_skill_md_is_under_150_lines(self):
         lines = SKILL_MD.read_text(encoding="utf-8").splitlines()
@@ -120,7 +121,7 @@ class SkillFrontmatterYamlSafetyTests(unittest.TestCase):
         except ImportError:
             self.skipTest("PyYAML not installed")
         data = yaml.safe_load("\n".join(self._frontmatter_lines()))
-        self.assertEqual(data["name"], "jev")
+        self.assertEqual(data["name"], "jev-code-router")
         self.assertLessEqual(len(data["description"]), 1024)
 
 

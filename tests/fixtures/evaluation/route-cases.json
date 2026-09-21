@@ -1,0 +1,17 @@
+[
+  {"id":"e1","task":"Correct an explicit typo in one documentation file.","changes_code":false},
+  {"id":"e2","task":"Rename one local symbol with known references and run its focused test.","changes_code":true},
+  {"id":"e3","task":"Update one literal string in a test fixture with an exact expected value.","changes_code":true},
+  {"id":"e4","task":"Bump one documented version where the desired value is supplied.","changes_code":true},
+  {"id":"e5","task":"Add one missing null check in a named function with an existing focused test.","changes_code":true},
+  {"id":"s1","task":"Add a normal endpoint and tests following an established local pattern.","changes_code":true},
+  {"id":"s2","task":"Diagnose a localized failing test with two plausible causes.","changes_code":true},
+  {"id":"s3","task":"Refactor a small module while preserving its public API.","changes_code":true},
+  {"id":"s4","task":"Review a modest feature branch for spec and repository conventions.","changes_code":false},
+  {"id":"s5","task":"Implement a routine form workflow where some repository context is missing.","changes_code":true},
+  {"id":"d1","task":"Plan a cross-service authentication migration.","changes_code":true,"safety_sensitivity":"security and deployment"},
+  {"id":"d2","task":"Investigate a concurrency bug spanning the queue, cache, and worker.","changes_code":true},
+  {"id":"d3","task":"Design a database migration with irreversible production consequences.","changes_code":true,"safety_sensitivity":"deployment"},
+  {"id":"d4","task":"Diagnose intermittent data corruption across multiple components.","changes_code":true,"safety_sensitivity":"high consequence"},
+  {"id":"d5","task":"Review an authorization boundary after repeated unclear failures.","changes_code":false,"safety_sensitivity":"security"}
+]

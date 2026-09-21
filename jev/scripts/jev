@@ -372,7 +372,7 @@ _conn_stats = {"new": 0, "reused": 0}
 # 复用连接上遇到这些错误，且是在拿到任何响应字节之前失败的，说明连接已经失效（比如
 # 服务端悄悄断开了空闲连接），不算真正的网络故障：丢弃后立刻用新连接重试一次，不占
 # --retries 名额、不 backoff（decision POST 没有副作用，重放是安全的）。
-_STALE_CONN_ERRNOS = {errno.EPIPE, errno.ECONNRESET}
+_STALE_CONN_ERRNOS = {errno.EPIPE, errno.ECONNRESET, 10053}  # 10053 = WSAECONNABORTED
 
 
 def _record_conn_stat(is_new):

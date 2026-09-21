@@ -33,6 +33,12 @@ class JevTestCase(unittest.TestCase):
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
         }
+        # Native Windows subprocesses need these OS runtime variables for
+        # Winsock/TLS initialization. Preserve no user credential variables.
+        if os.name == "nt":
+            for name in ("SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP"):
+                if os.environ.get(name):
+                    env[name] = os.environ[name]
         if api_key is not None:
             env["OPENROUTER_API_KEY"] = api_key
         env.update(overrides)

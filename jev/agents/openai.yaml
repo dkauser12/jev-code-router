@@ -1,4 +1,7 @@
 interface:
-  display_name: "Jev Decisions"
-  short_description: "Typed yes/no, choice and score decisions with calibrated probabilities"
-  default_prompt: "Use $jev to classify or filter this with a calibrated probability."
+  display_name: "Jev Code Router"
+  short_description: "Bounded coding route, context, and escalation judgments"
+  default_prompt: "Use $jev-code-router for this bounded coding judgment."
+
+policy:
+  allow_implicit_invocation: false

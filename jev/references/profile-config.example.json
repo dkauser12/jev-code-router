@@ -1,0 +1,5 @@
+{
+  "economy": {"model": null, "effort": "low"},
+  "standard": {"model": null, "effort": null},
+  "deep": {"model": null, "effort": "high"}
+}

@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""Bounded coding judgments backed by the bundled Jev CLI."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+
+SCHEMA_VERSION = 1
+DEFAULT_TIMEOUT = 1.5
+ROUTE_LABELS = ("economy", "standard", "deep")
+ESCALATE_LABELS = ("stay", "escalate")
+PROFILE_LEVELS = ("economy", "standard", "deep")
+MAX_STATE_BYTES = 64 * 1024
+MAX_CANDIDATES = 50
+CONTEXT_SKIP_BELOW = 6
+UNCERTAIN_LOW = 0.40
+UNCERTAIN_HIGH = 0.60
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_DIR = SCRIPT_DIR.parent
+DEFAULT_JEV = SCRIPT_DIR / "jev"
+SPECS = {
+    "route": SKILL_DIR / "specs" / "code-route.json",
+    "context": SKILL_DIR / "specs" / "code-context.json",
+    "escalate": SKILL_DIR / "specs" / "code-escalate.json",
+}
+
+
+class InputError(ValueError):
+    pass
+
+
+def _safe_reason(value: str) -> str:
+    allowed = {"api_error", "timeout", "malformed_response", "missing_answer",
+               "unknown_label", "invalid_probability", "uncertain",
+               "below_context_threshold", "already_at_deep"}
+    return value if value in allowed else "api_error"
+
+
+def _base_output(decision, *, fallback: bool, reason: Optional[str] = None):
+    out = {
+        "schema_version": SCHEMA_VERSION,
+        "decision": decision,
+        "selected_probability": None,
+        "distribution": {},
+        "provider": "openrouter",
+        "model": "~typesafe/jev-latest",
+        "fallback": fallback,
+    }
+    if reason:
+        out["reason"] = _safe_reason(reason)
+    return out
+
+
+def _fallback(command: str, state: dict, reason: str):
+    if command == "route":
+        return _base_output("standard", fallback=True, reason=reason)
+    if command == "context":
+        ids = [candidate["id"] for candidate in state.get("candidates", [])]
+        return _base_output(ids, fallback=True, reason=reason)
+    out = _base_output("stay", fallback=True, reason=reason)
+    current = state.get("current_profile", "standard")
+    out.update({"current_profile": current, "recommended_profile": current})
+    return out
+
+
+def _load_state(path: str) -> dict:
+    try:
+        if path == "-":
+            raw = sys.stdin.read(MAX_STATE_BYTES + 1)
+        else:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = handle.read(MAX_STATE_BYTES + 1)
+    except OSError as exc:
+        raise InputError(f"cannot read state file: {exc}") from None
+    if len(raw.encode("utf-8")) > MAX_STATE_BYTES:
+        raise InputError(f"state exceeds {MAX_STATE_BYTES} bytes")
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise InputError(f"state is not valid JSON: {exc.msg}") from None
+    if not isinstance(state, dict):
+        raise InputError("state must be a JSON object")
+    return state
+
+
+def _short_string(state: dict, key: str, *, required: bool = False, limit: int = 4000):
+    value = state.get(key)
+    if value is None and not required:
+        return
+    if not isinstance(value, str) or (required and not value.strip()):
+        raise InputError(f"{key} must be a non-empty string")
+    if len(value) > limit:
+        raise InputError(f"{key} exceeds {limit} characters")
+
+
+def _validate_route(state: dict):
+    allowed = {"task", "repository_summary", "changes_code", "safety_sensitivity"}
+    unknown = sorted(set(state) - allowed)
+    if unknown:
+        raise InputError(f"unknown route fields: {', '.join(unknown)}")
+    _short_string(state, "task", required=True, limit=12000)
+    _short_string(state, "repository_summary", limit=4000)
+    if "changes_code" in state and not isinstance(state["changes_code"], bool):
+        raise InputError("changes_code must be a boolean")
+    sensitivity = state.get("safety_sensitivity")
+    if sensitivity is not None and not isinstance(sensitivity, (str, list)):
+        raise InputError("safety_sensitivity must be a string or list")
+
+
+def _validate_context(state: dict):
+    if set(state) - {"objective", "candidates"}:
+        raise InputError("context state supports only objective and candidates")
+    _short_string(state, "objective", required=True, limit=8000)
+    candidates = state.get("candidates")
+    if not isinstance(candidates, list):
+        raise InputError("candidates must be a list")
+    if len(candidates) > MAX_CANDIDATES:
+        raise InputError(f"candidates exceeds {MAX_CANDIDATES} items")
+    ids = set()
+    allowed = {"id", "path", "symbol", "excerpt", "reason"}
+    for index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict) or set(candidate) - allowed:
+            raise InputError(f"candidate {index} has an invalid shape")
+        candidate_id = candidate.get("id")
+        if not isinstance(candidate_id, str) or not candidate_id or len(candidate_id) > 200:
+            raise InputError(f"candidate {index} id must be a short non-empty string")
+        if candidate_id in ids:
+            raise InputError(f"duplicate candidate id: {candidate_id}")
+        ids.add(candidate_id)
+        for key, value in candidate.items():
+            if not isinstance(value, str) or len(value) > 2000:
+                raise InputError(f"candidate {index} field {key} must be a short string")
+
+
+def _validate_escalate(state: dict):
+    allowed = {"current_profile", "task", "failure_evidence"}
+    unknown = sorted(set(state) - allowed)
+    if unknown:
+        raise InputError(f"unknown escalation fields: {', '.join(unknown)}")
+    profile = state.get("current_profile")
+    if profile not in PROFILE_LEVELS:
+        raise InputError("current_profile must be economy, standard, or deep")
+    _short_string(state, "task", required=True, limit=8000)
+    evidence = state.get("failure_evidence")
+    if not isinstance(evidence, dict) or not evidence:
+        raise InputError("failure_evidence must be a non-empty object")
+    evidence_allowed = {
+        "failed_test_summary", "unsuccessful_edit_count", "unresolved_ambiguity",
+        "unable_to_locate_code",
+    }
+    if set(evidence) - evidence_allowed:
+        raise InputError("failure_evidence contains an unsupported field")
+    if "unsuccessful_edit_count" in evidence:
+        count = evidence["unsuccessful_edit_count"]
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise InputError("unsuccessful_edit_count must be a non-negative integer")
+    for key in evidence_allowed - {"unsuccessful_edit_count"}:
+        if key in evidence and not isinstance(evidence[key], (str, bool)):
+            raise InputError(f"failure_evidence.{key} must be a string or boolean")
+
+
+def _deadline() -> float:
+    raw = os.environ.get("JEV_CODE_TIMEOUT", str(DEFAULT_TIMEOUT))
+    try:
+        value = float(raw)
+    except ValueError:
+        raise InputError("JEV_CODE_TIMEOUT must be numeric") from None
+    if not (0.1 <= value <= 10.0):
+        raise InputError("JEV_CODE_TIMEOUT must be between 0.1 and 10 seconds")
+    return value
+
+
+def _jev_path() -> Path:
+    override = os.environ.get("JEV_CODE_JEV_PATH")
+    return Path(override) if override else DEFAULT_JEV
+
+
+def _invoke(args: list[str], *, input_text: Optional[str] = None):
+    deadline = _deadline()
+    command = [sys.executable, str(_jev_path()), *args,
+               "--provider", "openrouter", "--timeout", str(deadline), "--retries", "0"]
+    try:
+        proc = subprocess.run(
+            command, input=input_text, text=True, encoding="utf-8", capture_output=True,
+            timeout=deadline + 1.0, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except (OSError, ValueError):
+        return None, "api_error"
+    if proc.returncode != 0:
+        return None, "api_error"
+    return proc.stdout, None
+
+
+def _probability(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError
+    result = float(value)
+    if not math.isfinite(result) or not 0.0 <= result <= 1.0:
+        raise ValueError
+    return result
+
+
+def _parse_choice(stdout: str, labels: tuple[str, ...]):
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None, "malformed_response"
+    if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
+        return None, "missing_answer"
+    answer = data["answers"].get("decision")
+    if not isinstance(answer, dict):
+        return None, "missing_answer"
+    label = answer.get("choice")
+    if label not in labels:
+        return None, "unknown_label"
+    probabilities = answer.get("probabilities")
+    if not isinstance(probabilities, dict) or set(probabilities) != set(labels):
+        return None, "invalid_probability"
+    try:
+        distribution = {name: _probability(probabilities[name]) for name in labels}
+    except ValueError:
+        return None, "invalid_probability"
+    selected = distribution[label]
+    if selected < 0.5:
+        return None, "uncertain"
+    return {
+        "decision": label,
+        "selected_probability": selected,
+        "distribution": distribution,
+        "provider": data.get("provider") or "openrouter",
+        "model": data.get("model") or "~typesafe/jev-latest",
+    }, None
+
+
+def _run_choice(command: str, state: dict, labels: tuple[str, ...]):
+    stdout, error = _invoke(
+        ["run", str(SPECS[command]), "-s", "-", "--json"],
+        input_text=json.dumps(state, ensure_ascii=False),
+    )
+    if error:
+        return _fallback(command, state, error)
+    parsed, error = _parse_choice(stdout, labels)
+    if error:
+        return _fallback(command, state, error)
+    parsed.update({"schema_version": SCHEMA_VERSION, "fallback": False})
+    return {key: parsed[key] for key in (
+        "schema_version", "decision", "selected_probability", "distribution",
+        "provider", "model", "fallback")}
+
+
+def _run_route(state: dict):
+    return _run_choice("route", state, ROUTE_LABELS)
+
+
+def _run_escalate(state: dict):
+    current = state["current_profile"]
+    if current == "deep":
+        out = _base_output("stay", fallback=False, reason="already_at_deep")
+        out.update({"current_profile": current, "recommended_profile": current})
+        return out
+    out = _run_choice("escalate", state, ESCALATE_LABELS)
+    if out["fallback"]:
+        out.update({"current_profile": current, "recommended_profile": current})
+        return out
+    next_profile = PROFILE_LEVELS[PROFILE_LEVELS.index(current) + 1]
+    out.update({
+        "current_profile": current,
+        "recommended_profile": next_profile if out["decision"] == "escalate" else current,
+    })
+    return out
+
+
+def _run_context(state: dict):
+    candidates = state["candidates"]
+    if len(candidates) < CONTEXT_SKIP_BELOW:
+        return _fallback("context", state, "below_context_threshold")
+    lines = [
+        json.dumps({"objective": state["objective"], "candidate": candidate}, ensure_ascii=False)
+        for candidate in candidates
+    ]
+    stdout, error = _invoke(
+        ["run", str(SPECS["context"]), "-l", "-j", "8", "--json"],
+        input_text="\n".join(lines) + "\n",
+    )
+    if error:
+        return _fallback("context", state, error)
+    rows = stdout.splitlines()
+    if len(rows) != len(candidates):
+        return _fallback("context", state, "missing_answer")
+    selected = []
+    distribution = {}
+    selected_probs = []
+    try:
+        for candidate, row in zip(candidates, rows):
+            data = json.loads(row)
+            answer = data["answers"]["selected"]
+            probability = _probability(answer["noul"])
+            candidate_id = candidate["id"]
+            distribution[candidate_id] = {"select": probability, "skip": 1.0 - probability}
+            if UNCERTAIN_LOW < probability < UNCERTAIN_HIGH:
+                return _fallback("context", state, "uncertain")
+            if probability >= 0.5:
+                selected.append(candidate_id)
+                selected_probs.append(probability)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return _fallback("context", state, "malformed_response")
+    out = _base_output(selected, fallback=False)
+    out["selected_probability"] = min(selected_probs) if selected_probs else None
+    out["distribution"] = distribution
+    return out
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="jev-code",
+        description="Bounded coding judgments via the bundled Jev CLI and OpenRouter.",
+        epilog=("Exit codes: 0 = validated decision or fail-open fallback; "
+                "2 = invalid local input or usage. API failures never block the caller."),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for name in ("route", "context", "escalate"):
+        sub = subparsers.add_parser(name)
+        sub.add_argument("--state-file", required=True, metavar="PATH|-",
+                         help="JSON state file, or - to read JSON from stdin")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        state = _load_state(args.state_file)
+        if args.command == "route":
+            _validate_route(state)
+            output = _run_route(state)
+        elif args.command == "context":
+            _validate_context(state)
+            output = _run_context(state)
+        else:
+            _validate_escalate(state)
+            output = _run_escalate(state)
+    except InputError as exc:
+        print(f"jev-code: invalid input: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(output, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

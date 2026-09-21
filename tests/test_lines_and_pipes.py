@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import subprocess
+import os
 import time
+import unittest
 
 from base import JevTestCase
 from mock_server import MockDecisionsServer
@@ -34,6 +36,7 @@ class LineOrderTests(JevTestCase):
 
 
 class BrokenPipeTests(JevTestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX broken-pipe exit semantics differ on Windows")
     def test_downstream_closing_early_does_not_traceback(self):
         with MockDecisionsServer() as mock:
             env = self.base_env(JEV_BASE_URL=mock.base_url)

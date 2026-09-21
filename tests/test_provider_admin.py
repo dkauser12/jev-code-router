@@ -73,6 +73,7 @@ class ProviderDefaultTests(JevTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "auto")
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits are not portable to Windows")
     def test_set_and_read_back(self):
         env = self.base_env(api_key="or-test", TYPESAFE_API_KEY="ts-test")
         set_proc = self.run_jev(["provider", "default", "openrouter"], env=env)
@@ -173,6 +174,7 @@ class AuthRemoveTests(JevTestCase):
         self.assertIn("JEV_ENV_FILE", proc.stderr)
         self.assertEqual(custom.read_text(encoding="utf-8"), "TYPESAFE_API_KEY=ts-test\n")
 
+    @unittest.skipIf(os.name == "nt", "creating symlinks may require Windows developer mode")
     def test_symlinked_env_file_stays_a_symlink(self):
         real_dir = self.tmp_path / "real-secrets"
         real_dir.mkdir()
@@ -303,7 +305,10 @@ class DataLossGuardTests(JevTestCase):
         d.mkdir(parents=True, exist_ok=True)
         return d / ".env"
 
-    @unittest.skipIf(os.geteuid() == 0, "root can read a mode-000 file")
+    @unittest.skipIf(
+        os.name == "nt" or getattr(os, "geteuid", lambda: 1)() == 0,
+        "requires POSIX unreadable-file permissions as a non-root user",
+    )
     def test_unreadable_env_file_stops_auth_set_and_keeps_the_other_key(self):
         f = self._env_file()
         f.write_text("OPENROUTER_API_KEY=sk-or-keep-me\n", encoding="utf-8")

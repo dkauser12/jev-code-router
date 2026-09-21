@@ -1,0 +1,14 @@
+{
+  "description": "Choose one bounded coding-work profile from observable task properties",
+  "questions": {
+    "decision": {
+      "type": "choice",
+      "instructions": "Choose the work profile. Use standard whenever the evidence is incomplete, mixed, ambiguous, or uncertain.",
+      "criteria": {
+        "economy": "Narrow, explicit, local, mechanically verifiable work with low ambiguity and no security, deployment, migration, architecture, or high-consequence sensitivity",
+        "standard": "Ordinary implementation or diagnosis, mixed work, incomplete context, boundary cases, or any uncertain classification",
+        "deep": "Cross-component architecture, difficult debugging, security-sensitive work, migrations, unclear repeated failures, concurrency, or other high-consequence work"
+      }
+    }
+  }
+}

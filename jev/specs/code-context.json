@@ -1,0 +1,13 @@
+{
+  "description": "Judge whether one allowlisted retrieval candidate is relevant to one objective",
+  "questions": {
+    "selected": {
+      "type": "noul",
+      "instructions": "Is this candidate materially relevant enough to inspect for the stated objective?",
+      "criteria": {
+        "true": "The path, symbol, excerpt, or retrieval reason provides concrete evidence that inspecting this candidate can advance the objective",
+        "false": "The metadata is unrelated, redundant, or too weak to justify inspecting this candidate"
+      }
+    }
+  }
+}
